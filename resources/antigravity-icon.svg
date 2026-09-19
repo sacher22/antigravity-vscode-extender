@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="50%" stop-color="#1e1b4b"/>
+      <stop offset="100%" stop-color="#311042"/>
+    </linearGradient>
+    <linearGradient id="topFace" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#06b6d4"/>
+    </linearGradient>
+    <linearGradient id="leftFace" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#2563eb"/>
+      <stop offset="100%" stop-color="#1d4ed8"/>
+    </linearGradient>
+    <linearGradient id="rightFace" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#6366f1"/>
+      <stop offset="100%" stop-color="#4f46e5"/>
+    </linearGradient>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="8" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+  </defs>
+
+  <!-- Background Squircle -->
+  <rect x="48" y="48" width="416" height="416" rx="88" fill="url(#bgGrad)" stroke="#6366f1" stroke-width="4" stroke-opacity="0.6"/>
+
+  <!-- Orbital Ring (Zero-G Antigravity Field) -->
+  <g transform="rotate(-28 256 250)">
+    <ellipse cx="256" cy="250" rx="160" ry="65" fill="none" stroke="#93c5fd" stroke-width="4" stroke-opacity="0.4" stroke-dasharray="10 8"/>
+    <circle cx="96" cy="250" r="7" fill="#38bdf8" filter="url(#glow)"/>
+    <circle cx="416" cy="250" r="5" fill="#a855f7" filter="url(#glow)"/>
+  </g>
+
+  <!-- Central Hovering Crystal Core -->
+  <g filter="url(#glow)">
+    <!-- Top Face -->
+    <polygon points="256,160 336,205 256,245 176,205" fill="url(#topFace)" stroke="#7dd3fc" stroke-width="2"/>
+    <!-- Left Face -->
+    <polygon points="176,205 256,245 256,345 176,305" fill="url(#leftFace)" stroke="#60a5fa" stroke-width="1.5"/>
+    <!-- Right Face -->
+    <polygon points="336,205 256,245 256,345 336,305" fill="url(#rightFace)" stroke="#818cf8" stroke-width="1.5"/>
+  </g>
+
+  <!-- White Upward Vector (Lift / Extender Arrow) -->
+  <polygon points="256,195 294,225 280,235 256,215 232,235 218,225" fill="#ffffff" opacity="0.95"/>
+
+  <!-- Energy Ripple Base -->
+  <ellipse cx="256" cy="375" rx="60" ry="7" fill="#38bdf8" opacity="0.6"/>
+  <ellipse cx="256" cy="395" rx="40" ry="5" fill="#38bdf8" opacity="0.4"/>
+  <ellipse cx="256" cy="410" rx="20" ry="3" fill="#38bdf8" opacity="0.2"/>
+</svg>

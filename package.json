@@ -1,0 +1,157 @@
+{
+  "name": "antigravity-vscode-extender",
+  "displayName": "Antigravity Extender",
+  "description": "Supercharged Antigravity AI Coding Extender for VS Code with Native Stream-JSON & Agent Capabilities",
+  "version": "1.2.2",
+  "publisher": "antigravity",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Programming Languages",
+    "Snippets"
+  ],
+  "main": "./out/extension.js",
+  "icon": "resources/antigravity-icon.png",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "antigravity-sidebar",
+          "title": "Antigravity Extender",
+          "icon": "resources/activitybar-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "antigravity-sidebar": [
+        {
+          "type": "webview",
+          "id": "antigravity.chatView",
+          "name": "Antigravity Agent"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "antigravity.openChat",
+        "title": "Antigravity: Open Chat Sidebar",
+        "category": "Antigravity"
+      },
+      {
+        "command": "antigravity.newSession",
+        "title": "Antigravity: New Conversation",
+        "category": "Antigravity"
+      },
+      {
+        "command": "antigravity.explainCode",
+        "title": "Antigravity: Explain Code",
+        "category": "Antigravity"
+      },
+      {
+        "command": "antigravity.refactorCode",
+        "title": "Antigravity: Refactor Code",
+        "category": "Antigravity"
+      },
+      {
+        "command": "antigravity.generateTests",
+        "title": "Antigravity: Generate Unit Tests",
+        "category": "Antigravity"
+      },
+      {
+        "command": "antigravity.fixCode",
+        "title": "Antigravity: Fix Problems & Bugs",
+        "category": "Antigravity"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "antigravity.explainCode",
+          "group": "Antigravity@1",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "antigravity.refactorCode",
+          "group": "Antigravity@2",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "antigravity.generateTests",
+          "group": "Antigravity@3",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "antigravity.fixCode",
+          "group": "Antigravity@4",
+          "when": "editorHasSelection"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Antigravity Extender",
+      "properties": {
+        "antigravity.cliPath": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to the Antigravity (agy) binary. If empty, automatically detected in PATH and standard locations."
+        },
+        "antigravity.defaultModel": {
+          "type": "string",
+          "default": "gemini-3.8-flash-high",
+          "enum": [
+            "gemini-3.8-flash-high",
+            "gemini-3.8-flash-medium",
+            "gemini-3.8-flash-low",
+            "gemini-3.7-flash-high",
+            "gemini-3.7-flash-medium",
+            "gemini-3.1-pro-high"
+          ],
+          "description": "Default model used for Antigravity sessions."
+        },
+        "antigravity.reasoningEffort": {
+          "type": "string",
+          "default": "high",
+          "enum": [
+            "high",
+            "medium",
+            "low"
+          ],
+          "description": "Reasoning effort / thinking budget level."
+        },
+        "antigravity.dangerouslySkipPermissions": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically allow tool execution (file editing, terminal commands) without manual approval prompts (Danger Mode)."
+        },
+        "antigravity.autoScroll": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically scroll to the bottom during agent streaming responses."
+        },
+        "antigravity.includeProjectRules": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically load .antigravityrules or AGENTS.md from workspace root as instructions."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.2.1",
+    "typescript": "^5.3.3"
+  }
+}
