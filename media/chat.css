@@ -175,6 +175,22 @@ body {
   gap: 14px;
 }
 
+.load-history-btn {
+  align-self: center;
+  padding: 4px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  color: var(--text-secondary);
+  background: transparent;
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.load-history-btn:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.06);
+}
+
 .message {
   display: flex;
   flex-direction: column;
@@ -204,6 +220,65 @@ body {
 .message.user .message-bubble {
   background: rgba(0, 122, 204, 0.12);
   border-color: rgba(0, 122, 204, 0.3);
+}
+
+.assistant-turn {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.thinking-placeholder {
+  min-height: 34px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-secondary);
+  background: var(--bg-primary);
+}
+
+.stream-tail:empty {
+  display: none;
+}
+
+.message-error {
+  padding: 8px 10px;
+  border-left: 3px solid var(--accent-red);
+  color: var(--vscode-errorForeground, #f48771);
+  background: var(--vscode-inputValidation-errorBackground, rgba(211, 47, 47, 0.12));
+}
+
+.resource-link {
+  color: var(--vscode-textLink-foreground, #4daafc);
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.resource-link:hover {
+  color: var(--vscode-textLink-activeForeground, #4daafc);
+  text-decoration: underline;
+}
+
+.confirmation-actions {
+  display: flex;
+  gap: 6px;
+  padding-top: 2px;
+}
+
+.confirmation-actions button {
+  padding: 4px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  color: var(--text-primary);
+  background: var(--vscode-button-secondaryBackground, rgba(255, 255, 255, 0.08));
+  cursor: pointer;
+}
+
+.confirmation-actions .confirmation-primary {
+  border-color: transparent;
+  color: var(--vscode-button-foreground, #ffffff);
+  background: var(--accent-primary);
 }
 
 /* Code Block with Actions */
@@ -271,6 +346,8 @@ pre {
   padding: 6px 10px;
   cursor: pointer;
   background: rgba(255, 255, 255, 0.04);
+  gap: 8px;
+  min-height: 34px;
 }
 
 .tool-card-header:hover {
@@ -281,6 +358,37 @@ pre {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+
+.tool-summary {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--vscode-editor-font-family, monospace);
+}
+
+.tool-spinner {
+  width: 12px;
+  height: 12px;
+  flex: 0 0 12px;
+  border: 2px solid var(--border-color);
+  border-top-color: var(--accent-primary);
+  border-radius: 50%;
+  animation: tool-spin 0.8s linear infinite;
+}
+
+@keyframes tool-spin {
+  to { transform: rotate(360deg); }
+}
+
+.tool-chevron {
+  width: 12px;
+  flex: 0 0 12px;
+  color: var(--text-secondary);
+  text-align: center;
+  font-size: 15px;
 }
 
 .tool-badge {
@@ -312,10 +420,16 @@ pre {
   font-family: var(--vscode-editor-font-family, monospace);
   font-size: 11px;
   white-space: pre-wrap;
-  word-break: break-all;
-  max-height: 200px;
+  word-break: break-word;
+  max-height: 320px;
   overflow-y: auto;
   background: rgba(0, 0, 0, 0.2);
+}
+
+.tool-output {
+  padding: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 /* Context preview snippet */
@@ -511,6 +625,12 @@ pre {
   padding: 4px 8px;
   font-size: 12px;
   cursor: pointer;
+}
+
+button:disabled,
+select:disabled {
+  opacity: 0.55;
+  cursor: default;
 }
 
 .plan-mode-pill {

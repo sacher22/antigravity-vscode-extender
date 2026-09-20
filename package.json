@@ -2,8 +2,12 @@
   "name": "antigravity-vscode-extender",
   "displayName": "Antigravity Extender",
   "description": "Supercharged Antigravity AI Coding Extender for VS Code with Native Stream-JSON & Agent Capabilities",
-  "version": "1.2.2",
+  "version": "1.3.3",
   "publisher": "antigravity",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sacher22/antigravity-vscode-extender.git"
+  },
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -14,6 +18,13 @@
     "Snippets"
   ],
   "main": "./out/extension.js",
+  "files": [
+    "out/**/*",
+    "media/**/*",
+    "resources/**/*",
+    "README.md",
+    "LICENSE"
+  ],
   "icon": "resources/antigravity-icon.png",
   "activationEvents": [
     "onStartupFinished"
@@ -145,6 +156,7 @@
   "scripts": {
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
+    "test": "npm run compile && node --test test/*.test.js",
     "watch": "tsc -watch -p ./",
     "package": "vsce package --no-dependencies"
   },

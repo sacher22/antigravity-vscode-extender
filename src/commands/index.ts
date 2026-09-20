@@ -84,8 +84,8 @@ export function registerCommands(
 
   // New Session
   context.subscriptions.push(
-    vscode.commands.registerCommand("antigravity.newSession", async () => {
-      await agyService.startOrSwitchSession();
+    vscode.commands.registerCommand("antigravity.newSession", () => {
+      chatProvider.createNewSession();
     })
   );
 }

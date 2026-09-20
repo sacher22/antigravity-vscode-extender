@@ -18,15 +18,27 @@
   const chipProblems = document.getElementById("chip-problems");
   const planModePill = document.getElementById("plan-mode-pill");
   const closePlanModeBtn = document.getElementById("close-plan-mode-btn");
-
-  let isPlanModeActive = false;
+  const MODEL_EFFORTS = {
+    "gemini-3.8-flash-high": ["low", "medium", "high"],
+    "gemini-3.7-flash-high": ["medium", "high"],
+    "gemini-3.1-pro-high": ["high"]
+  };
 
   let currentContext = null;
   let isGenerating = false;
-  let activeAssistantBubble = null;
-  let activeToolCards = {}; // stepIndex -> HTMLElement
+  let activeAssistantTurn = null;
+  let activeTextBlocks = {};
+  let activeToolCards = {};
   let currentRawText = "";
   let isDangerMode = true;
+  let autoScrollEnabled = true;
+  let streamFlushTimer = null;
+  let turnStatusTimer = null;
+  let turnStartedAt = 0;
+  let loadedSessionMessages = [];
+  let historyLimit = 30;
+  let firstRenderReported = false;
+  let isRenderingHistory = false;
 
   // Configure marked safely
   if (typeof marked !== "undefined" && marked.setOptions) {
@@ -44,7 +56,7 @@
     if (window.marked) {
       try {
         const rawHtml = marked.parse(md);
-        return wrapCodeBlocks(rawHtml);
+        return decorateFileReferences(wrapCodeBlocks(sanitizeHtml(rawHtml)));
       } catch (e) {
         return escapeHtml(md);
       }
@@ -53,7 +65,85 @@
   }
 
   function escapeHtml(str) {
-    return str.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    return String(str).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+
+  function sanitizeHtml(html) {
+    const template = document.createElement("template");
+    template.innerHTML = html;
+    template.content.querySelectorAll("script,style,iframe,object,embed,link,meta,form").forEach((el) => el.remove());
+    template.content.querySelectorAll("*").forEach((el) => {
+      Array.from(el.attributes).forEach((attr) => {
+        const name = attr.name.toLowerCase();
+        const value = attr.value.trim().toLowerCase();
+        if (name.startsWith("on") || ((name === "href" || name === "src") && value.startsWith("javascript:"))) {
+          el.removeAttribute(attr.name);
+        }
+      });
+    });
+    return template.innerHTML;
+  }
+
+  function isOpenableReference(value) {
+    if (!value) return false;
+    return /^(?:https?:\/\/|file:\/\/|\/|~\/|\.\.?\/)/i.test(value) ||
+      /^[^?#]+\.(?:html?|svg|css|[cm]?[jt]sx?|json|md|py|java|go|rs|c|cc|cpp|h|hpp|sh|ya?ml|toml|txt)(?:(?:#L|:)\d+(?::\d+)?)?$/i.test(value);
+  }
+
+  function decorateFileReferences(html) {
+    const template = document.createElement("template");
+    template.innerHTML = html;
+    template.content.querySelectorAll("a").forEach((anchor) => {
+      const href = anchor.getAttribute("href") || "";
+      if (isOpenableReference(href)) {
+        anchor.classList.add("resource-link");
+        anchor.title = "Open in VS Code";
+      }
+    });
+    template.content.querySelectorAll("code").forEach((code) => {
+      if (code.closest("pre") || code.closest("a")) return;
+      const value = code.textContent?.trim() || "";
+      if (!isOpenableReference(value)) return;
+      const anchor = document.createElement("a");
+      anchor.className = "resource-link";
+      anchor.dataset.resourceHref = value;
+      anchor.title = "Open in VS Code";
+      code.replaceWith(anchor);
+      anchor.appendChild(code);
+    });
+    const textNodes = [];
+    const collectTextNodes = (node) => {
+      node.childNodes.forEach((child) => {
+        if (child.nodeType === Node.TEXT_NODE && !child.parentElement?.closest("a,code,pre")) {
+          textNodes.push(child);
+        } else if (child.nodeType === Node.ELEMENT_NODE && !child.closest("a,code,pre")) {
+          collectTextNodes(child);
+        }
+      });
+    };
+    collectTextNodes(template.content);
+    const filePattern = /((?:file:\/\/\/|~\/|\.{1,2}\/|\/)?(?:[\w.@-]+\/)*[\w.@-]+\.(?:html?|svg|css|[cm]?[jt]sx?|json|md|py|java|go|rs|c|cc|cpp|h|hpp|sh|ya?ml|toml|txt)(?:(?:#L|:)\d+(?::\d+)?)?)/gi;
+    textNodes.forEach((textNode) => {
+      const text = textNode.textContent || "";
+      const matches = Array.from(text.matchAll(filePattern));
+      if (!matches.length) return;
+      const fragment = document.createDocumentFragment();
+      let offset = 0;
+      matches.forEach((match) => {
+        const index = match.index || 0;
+        fragment.appendChild(document.createTextNode(text.slice(offset, index)));
+        const anchor = document.createElement("a");
+        anchor.className = "resource-link";
+        anchor.dataset.resourceHref = match[0];
+        anchor.title = "Open in VS Code";
+        anchor.textContent = match[0];
+        fragment.appendChild(anchor);
+        offset = index + match[0].length;
+      });
+      fragment.appendChild(document.createTextNode(text.slice(offset)));
+      textNode.replaceWith(fragment);
+    });
+    return template.innerHTML;
   }
 
   function wrapCodeBlocks(html) {
@@ -63,7 +153,6 @@
     const preElements = div.querySelectorAll("pre");
     preElements.forEach((pre) => {
       const code = pre.querySelector("code");
-      const codeText = code ? code.innerText : pre.innerText;
       let lang = "";
       if (code) {
         const classes = code.className.split(" ");
@@ -91,29 +180,20 @@
       pre.parentNode.insertBefore(wrapper, pre);
       wrapper.appendChild(pre);
 
-      const copyBtn = header.querySelector(".copy-btn");
-      copyBtn.addEventListener("click", () => {
-        vscode.postMessage({ command: "copyToClipboard", text: codeText });
-        copyBtn.innerText = "Copied!";
-        setTimeout(() => { copyBtn.innerText = "Copy"; }, 2000);
-      });
-
-      const insertBtn = header.querySelector(".insert-btn");
-      insertBtn.addEventListener("click", () => {
-        vscode.postMessage({ command: "applyCodeToEditor", code: codeText });
-      });
-
-      const diffBtn = header.querySelector(".diff-btn");
-      diffBtn.addEventListener("click", () => {
-        vscode.postMessage({ command: "viewDiff", code: codeText });
-      });
     });
 
     return div.innerHTML;
   }
 
-  function scrollToBottom() {
-    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+  function isNearBottom() {
+    return messagesContainer.scrollHeight - messagesContainer.scrollTop - messagesContainer.clientHeight < 80;
+  }
+
+  function scrollToBottom(force) {
+    if (isRenderingHistory) return;
+    if (force || (autoScrollEnabled && isNearBottom())) {
+      messagesContainer.scrollTop = messagesContainer.scrollHeight;
+    }
   }
 
   function appendUserMessage(text) {
@@ -131,10 +211,10 @@
     msg.appendChild(role);
     msg.appendChild(bubble);
     messagesContainer.appendChild(msg);
-    scrollToBottom();
+    scrollToBottom(true);
   }
 
-  function prepareAssistantMessage() {
+  function prepareAssistantMessage(showThinking = true) {
     const msg = document.createElement("div");
     msg.className = "message assistant";
 
@@ -142,109 +222,310 @@
     role.className = "message-role";
     role.textContent = "Antigravity";
 
-    const bubble = document.createElement("div");
-    bubble.className = "message-bubble";
-    bubble.innerHTML = "<em>Thinking...</em>";
+    const turn = document.createElement("div");
+    turn.className = "assistant-turn";
+    if (showThinking) {
+      const thinking = document.createElement("div");
+      thinking.className = "thinking-placeholder";
+      thinking.textContent = "Waiting for Antigravity...";
+      turn.appendChild(thinking);
+    }
 
     msg.appendChild(role);
-    msg.appendChild(bubble);
+    msg.appendChild(turn);
     messagesContainer.appendChild(msg);
 
-    activeAssistantBubble = bubble;
+    activeAssistantTurn = turn;
+    activeTextBlocks = {};
+    firstRenderReported = false;
     currentRawText = "";
     activeToolCards = {};
     scrollToBottom();
-    return bubble;
+    return turn;
   }
 
-  function updateAssistantText(delta) {
-    if (!activeAssistantBubble) {
+  function removeThinkingPlaceholder() {
+    activeAssistantTurn?.querySelector(".thinking-placeholder")?.remove();
+  }
+
+  function ensureTextBlock(stepIndex) {
+    if (!activeAssistantTurn) {
       prepareAssistantMessage();
     }
+    removeThinkingPlaceholder();
+    const key = String(stepIndex ?? 0);
+    if (!activeTextBlocks[key]) {
+      const bubble = document.createElement("div");
+      bubble.className = "message-bubble assistant-text-block";
+      const stable = document.createElement("div");
+      const tail = document.createElement("div");
+      tail.className = "stream-tail";
+      bubble.appendChild(stable);
+      bubble.appendChild(tail);
+      activeAssistantTurn.appendChild(bubble);
+      activeTextBlocks[key] = { element: bubble, stable, tail, raw: "", committed: 0 };
+    }
+    return activeTextBlocks[key];
+  }
+
+  function updateAssistantText(delta, stepIndex) {
+    const block = ensureTextBlock(stepIndex);
     currentRawText += delta;
-    activeAssistantBubble.innerHTML = renderMarkdown(currentRawText);
-    scrollToBottom();
+    block.raw += delta;
+    if (!streamFlushTimer) {
+      streamFlushTimer = setTimeout(() => flushAssistantText(false), 50);
+    }
+  }
+
+  function findStableBoundary(text) {
+    let boundary = -1;
+    let candidate = text.indexOf("\n\n");
+    while (candidate !== -1) {
+      const prefix = text.slice(0, candidate + 2);
+      const fenceCount = (prefix.match(/```/g) || []).length;
+      if (fenceCount % 2 === 0) boundary = candidate + 2;
+      candidate = text.indexOf("\n\n", candidate + 2);
+    }
+    return boundary;
+  }
+
+  function renderSessionHistory() {
+    isRenderingHistory = true;
+    messagesContainer.innerHTML = "";
+    activeAssistantTurn = null;
+    activeTextBlocks = {};
+    activeToolCards = {};
+    currentRawText = "";
+
+    const visible = loadedSessionMessages.slice(-historyLimit);
+    if (visible.length < loadedSessionMessages.length) {
+      const loadButton = document.createElement("button");
+      loadButton.className = "load-history-btn";
+      loadButton.textContent = `Load earlier messages (${loadedSessionMessages.length - visible.length})`;
+      loadButton.addEventListener("click", () => {
+        const oldHeight = messagesContainer.scrollHeight;
+        historyLimit += 30;
+        renderSessionHistory();
+        messagesContainer.scrollTop = messagesContainer.scrollHeight - oldHeight;
+      });
+      messagesContainer.appendChild(loadButton);
+    }
+
+    visible.forEach((message, index) => {
+      const textContent = message.content || message.text || "";
+      if (message.role === "user") {
+        appendUserMessage(textContent);
+      } else if (message.role === "assistant") {
+        prepareAssistantMessage(false);
+        if (textContent) updateAssistantText(textContent, -1);
+        flushAssistantText(true);
+        (message.toolCalls || []).forEach((tool) => {
+          updateToolCard(tool.stepIndex, tool.name, tool.state, {
+            parameters: tool.parameters,
+            output: tool.output
+          });
+        });
+        if (message.status === "awaiting_input" && index === visible.length - 1) {
+          appendAwaitingInputActions(message.pendingInputKind || "question");
+        }
+      }
+    });
+    isRenderingHistory = false;
+    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+  }
+
+  function flushAssistantText(final) {
+    if (streamFlushTimer) clearTimeout(streamFlushTimer);
+    streamFlushTimer = null;
+    const follow = isNearBottom();
+    Object.values(activeTextBlocks).forEach((block) => {
+      if (final) {
+        block.element.innerHTML = renderMarkdown(block.raw);
+        return;
+      }
+      const pending = block.raw.slice(block.committed);
+      const boundary = findStableBoundary(pending);
+      if (boundary > 0) {
+        block.stable.insertAdjacentHTML("beforeend", renderMarkdown(pending.slice(0, boundary)));
+        block.committed += boundary;
+      }
+      block.tail.innerHTML = renderMarkdown(block.raw.slice(block.committed));
+    });
+    if (follow) scrollToBottom(true);
+    if (!isRenderingHistory && !firstRenderReported && currentRawText) {
+      firstRenderReported = true;
+      vscode.postMessage({ command: "reportRender", kind: "firstText", clientRenderedAt: Date.now() });
+    }
+  }
+
+  function toolSummary(toolName, toolInfo) {
+    const params = toolInfo?.parameters || {};
+    const command = params.CommandLine || params.command || params.cmd;
+    const file = params.TargetFile || params.file_path || params.path;
+    if (command) return String(command).split("\n")[0];
+    if (file) return String(file).replace(/^.*[\\/]/, "");
+    return String(toolName || "Tool").replace(/_/g, " ");
+  }
+
+  function toolFileReference(toolInfo) {
+    const params = toolInfo?.parameters || {};
+    return params.TargetFile || params.file_path || params.path || "";
+  }
+
+  function previewToolContent(data) {
+    let content = "";
+    if (data.parameters) content += `Params:\n${JSON.stringify(data.parameters, null, 2)}\n\n`;
+    if (data.output) content += `Output:\n${data.output}`;
+    const lines = content.split("\n");
+    if (lines.length > 200) content = lines.slice(0, 200).join("\n") + `\n\n... ${lines.length - 200} more lines`;
+    if (content.length > 32768) content = content.slice(0, 32768) + "\n\n... output truncated in preview";
+    return content;
   }
 
   function updateToolCard(stepIndex, toolName, state, toolInfo) {
-    if (!activeAssistantBubble) {
+    if (!activeAssistantTurn) {
       prepareAssistantMessage();
     }
+    removeThinkingPlaceholder();
 
-    let card = activeToolCards[stepIndex];
-    if (!card) {
-      card = document.createElement("div");
+    let entry = activeToolCards[stepIndex];
+    if (!entry) {
+      const card = document.createElement("div");
       card.className = "tool-card";
 
       const header = document.createElement("div");
-      header.className = "tool-header";
+      header.className = "tool-card-header";
+      header.setAttribute("role", "button");
+      header.setAttribute("tabindex", "0");
 
       const info = document.createElement("div");
-      info.className = "tool-info";
+      info.className = "tool-info-left";
 
       const spinner = document.createElement("div");
       spinner.className = "tool-spinner";
       info.appendChild(spinner);
 
-      const name = document.createElement("span");
-      name.textContent = `Tool: ${toolName}`;
+      const name = document.createElement("a");
+      name.className = "tool-summary";
+      name.textContent = toolSummary(toolName, toolInfo);
+      name.addEventListener("click", (event) => {
+        const href = name.dataset.resourceHref;
+        if (!href) return;
+        event.preventDefault();
+        event.stopPropagation();
+        vscode.postMessage({ command: "openResource", href });
+      });
       info.appendChild(name);
 
       const statusBadge = document.createElement("span");
-      statusBadge.className = "tool-status-badge";
+      statusBadge.className = "tool-badge running";
       statusBadge.textContent = "Running";
+
+      const chevron = document.createElement("span");
+      chevron.className = "tool-chevron";
+      chevron.textContent = "›";
 
       header.appendChild(info);
       header.appendChild(statusBadge);
-
-      const body = document.createElement("div");
-      body.className = "tool-body";
-
-      const outputPre = document.createElement("pre");
-      outputPre.className = "tool-output";
-      body.appendChild(outputPre);
-
+      header.appendChild(chevron);
       card.appendChild(header);
-      card.appendChild(body);
+      activeAssistantTurn.appendChild(card);
+      entry = { card, data: { parameters: null, output: "" }, expanded: false, userToggled: false };
+      activeToolCards[stepIndex] = entry;
 
-      header.addEventListener("click", () => {
-        body.classList.toggle("expanded");
+      const toggle = () => {
+        entry.userToggled = true;
+        setToolExpanded(entry, !entry.expanded);
+      };
+      header.addEventListener("click", toggle);
+      header.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") { event.preventDefault(); toggle(); }
       });
-
-      // Insert before current text bubble
-      const parent = activeAssistantBubble.parentNode;
-      parent.insertBefore(card, activeAssistantBubble);
-      activeToolCards[stepIndex] = card;
     }
 
+    const card = entry.card;
     const spinner = card.querySelector(".tool-spinner");
-    const statusBadge = card.querySelector(".tool-status-badge");
-    const outputPre = card.querySelector(".tool-output");
+    const statusBadge = card.querySelector(".tool-badge");
+    const summary = card.querySelector(".tool-summary");
+    if (toolInfo?.parameters) entry.data.parameters = toolInfo.parameters;
+    if (toolInfo?.output !== undefined) entry.data.output = toolInfo.output;
+    if (summary) summary.textContent = toolSummary(toolName, {
+      ...toolInfo,
+      parameters: toolInfo?.parameters || entry.data.parameters
+    });
+    const fileReference = toolFileReference({ parameters: toolInfo?.parameters || entry.data.parameters });
+    if (summary) {
+      summary.classList.toggle("resource-link", Boolean(fileReference));
+      if (fileReference) summary.dataset.resourceHref = fileReference;
+      else delete summary.dataset.resourceHref;
+    }
 
     if (state === "DONE") {
       if (spinner) spinner.style.display = "none";
       if (statusBadge) {
-        statusBadge.textContent = "✓ Completed";
-        statusBadge.className = "tool-status-badge tool-status-done";
+        statusBadge.textContent = "Done";
+        statusBadge.className = "tool-badge done";
       }
     } else if (state === "FAILED") {
       if (spinner) spinner.style.display = "none";
       if (statusBadge) {
-        statusBadge.textContent = "✕ Failed";
-        statusBadge.className = "tool-status-badge tool-status-failed";
+        statusBadge.textContent = "Failed";
+        statusBadge.className = "tool-badge failed";
       }
+      if (!entry.userToggled) setToolExpanded(entry, true);
     }
 
-    if (toolInfo && outputPre) {
-      let content = "";
-      if (toolInfo.parameters) {
-        content += `Params:\n${JSON.stringify(toolInfo.parameters, null, 2)}\n\n`;
-      }
-      if (toolInfo.output) {
-        content += `Output:\n${toolInfo.output}`;
-      }
-      outputPre.textContent = content;
+    if (entry.expanded) {
+      const output = card.querySelector(".tool-output");
+      if (output) output.textContent = previewToolContent(entry.data);
     }
+    scrollToBottom();
+  }
+
+  function setToolExpanded(entry, expanded) {
+    entry.expanded = expanded;
+    entry.card.classList.toggle("expanded", expanded);
+    const chevron = entry.card.querySelector(".tool-chevron");
+    if (chevron) chevron.textContent = expanded ? "⌄" : "›";
+    let body = entry.card.querySelector(".tool-card-body");
+    if (expanded && !body) {
+      body = document.createElement("div");
+      body.className = "tool-card-body";
+      const output = document.createElement("pre");
+      output.className = "tool-output";
+      output.textContent = previewToolContent(entry.data);
+      body.appendChild(output);
+      entry.card.appendChild(body);
+    } else if (!expanded && body) {
+      body.remove();
+    }
+  }
+
+  function appendAwaitingInputActions(kind) {
+    if (!activeAssistantTurn || activeAssistantTurn.querySelector(".confirmation-actions")) return;
+    const actions = document.createElement("div");
+    actions.className = "confirmation-actions";
+    if (kind === "confirmation") {
+      const execute = document.createElement("button");
+      execute.className = "confirmation-primary";
+      execute.textContent = "执行";
+      execute.addEventListener("click", () => {
+        chatInput.value = "执行";
+        handleSend();
+      });
+      const revise = document.createElement("button");
+      revise.textContent = "修改计划";
+      revise.addEventListener("click", () => chatInput.focus());
+      actions.appendChild(execute);
+      actions.appendChild(revise);
+    } else {
+      const answer = document.createElement("button");
+      answer.className = "confirmation-primary";
+      answer.textContent = "回答问题";
+      answer.addEventListener("click", () => chatInput.focus());
+      actions.appendChild(answer);
+    }
+    activeAssistantTurn.appendChild(actions);
   }
 
   function updatePermissionUI(danger) {
@@ -260,16 +541,68 @@
     }
   }
 
+  function syncEffortOptions() {
+    const supported = MODEL_EFFORTS[modelSelect.value] || ["high"];
+    Array.from(effortSelect.options).forEach((option) => {
+      option.disabled = !supported.includes(option.value);
+    });
+    if (!supported.includes(effortSelect.value)) effortSelect.value = supported[supported.length - 1];
+  }
+
   function setGenerating(generating) {
     isGenerating = generating;
+    modelSelect.disabled = generating;
+    effortSelect.disabled = generating;
+    permToggleBtn.disabled = generating;
+    newChatBtn.disabled = generating;
+    sessionSelect.disabled = generating;
     if (generating) {
       sendBtn.style.display = "none";
       stopBtn.style.display = "inline-flex";
-      statusInfo.textContent = "Agent executing...";
+      stopBtn.disabled = false;
+      stopBtn.textContent = "Stop";
+      if (!turnStartedAt) turnStartedAt = Date.now();
+      statusInfo.textContent = "Sending...";
+      startStatusClock();
     } else {
       sendBtn.style.display = "inline-flex";
       stopBtn.style.display = "none";
-      statusInfo.textContent = "Ready";
+      turnStartedAt = 0;
+      if (turnStatusTimer) clearInterval(turnStatusTimer);
+      turnStatusTimer = null;
+      if (!statusInfo.textContent.startsWith("Tokens:")) statusInfo.textContent = "Ready";
+    }
+  }
+
+  function startStatusClock() {
+    if (turnStatusTimer) return;
+    turnStatusTimer = setInterval(() => {
+      if (!isGenerating || !turnStartedAt) return;
+      const seconds = Math.floor((Date.now() - turnStartedAt) / 1000);
+      const base = statusInfo.dataset.phase || "Working";
+      statusInfo.textContent = `${base} · ${seconds}s`;
+    }, 1000);
+  }
+
+  function updateTurnState(state) {
+    const labels = {
+      connecting: "Connecting",
+      submitted: "Waiting for model",
+      waiting: "Still waiting",
+      responding: "Responding",
+      tool: state.detail ? `Running ${state.detail}` : "Running tool",
+      awaiting_input: "Waiting for your response",
+      stopping: "Stopping",
+      completed: "Ready",
+      failed: "Failed",
+      aborted: "Stopped"
+    };
+    statusInfo.dataset.phase = labels[state.phase] || "Working";
+    if (state.startedAt) turnStartedAt = state.startedAt;
+    statusInfo.textContent = statusInfo.dataset.phase;
+    if (state.phase === "stopping") {
+      stopBtn.disabled = true;
+      stopBtn.textContent = "Stopping...";
     }
   }
 
@@ -278,6 +611,7 @@
     if (!text || isGenerating) return;
 
     appendUserMessage(text);
+    document.querySelectorAll(".confirmation-actions").forEach((actions) => actions.remove());
     chatInput.value = "";
     chatInput.style.height = "auto";
 
@@ -295,6 +629,7 @@
     vscode.postMessage({
       command: "sendMessage",
       text: text,
+      clientSentAt: Date.now(),
       contextCode: contextPayload,
       filePath: filePathPayload
     });
@@ -310,12 +645,40 @@
 
   stopBtn.addEventListener("click", () => {
     vscode.postMessage({ command: "abortCurrentTurn" });
-    setGenerating(false);
+    stopBtn.disabled = true;
+    stopBtn.textContent = "Stopping...";
+    statusInfo.textContent = "Stopping...";
+  });
+
+  document.addEventListener("click", (event) => {
+    const anchor = event.target.closest?.("a");
+    if (anchor) {
+      const href = anchor.dataset.resourceHref || anchor.getAttribute("href") || "";
+      if (isOpenableReference(href)) {
+        event.preventDefault();
+        vscode.postMessage({ command: "openResource", href });
+        return;
+      }
+    }
+    const button = event.target.closest?.(".code-action-btn");
+    if (!button) return;
+    const wrapper = button.closest(".code-block-wrapper");
+    const code = wrapper?.querySelector("pre code")?.textContent || wrapper?.querySelector("pre")?.textContent || "";
+    if (button.classList.contains("copy-btn")) {
+      vscode.postMessage({ command: "copyToClipboard", text: code });
+      button.textContent = "Copied";
+      setTimeout(() => { button.textContent = "Copy"; }, 1200);
+    } else if (button.classList.contains("insert-btn")) {
+      vscode.postMessage({ command: "applyCodeToEditor", code });
+    } else if (button.classList.contains("diff-btn")) {
+      vscode.postMessage({ command: "viewDiff", code });
+    }
   });
 
   permToggleBtn.addEventListener("click", () => {
     const nextMode = !isDangerMode;
-    updatePermissionUI(nextMode);
+    permToggleBtn.disabled = true;
+    statusInfo.textContent = "Applying permission mode...";
     vscode.postMessage({ command: "togglePermission", dangerouslySkipPermissions: nextMode });
   });
 
@@ -403,11 +766,8 @@
     isSlashMenuOpen = false;
 
     if (item.command === "/plan") {
-      // Toggle plan mode or insert /plan
-      isPlanModeActive = true;
-      if (planModePill) planModePill.classList.remove("hidden");
-      chatInput.placeholder = "[Plan Mode] 描述你想规划的目标与方案...";
       chatInput.value = "";
+      statusInfo.textContent = "Enabling Plan mode...";
       vscode.postMessage({ command: "togglePlanMode", isPlanMode: true });
       chatInput.focus();
       return;
@@ -485,17 +845,28 @@
   });
 
   newChatBtn.addEventListener("click", () => {
+    chatInput.value = "";
+    chatInput.style.height = "auto";
+    clearContext();
+    statusInfo.textContent = "Ready";
     vscode.postMessage({ command: "newSession" });
   });
 
   sessionSelect.addEventListener("change", () => {
     const targetId = sessionSelect.value;
     if (targetId) {
+      chatInput.value = "";
+      chatInput.style.height = "auto";
+      clearContext();
       vscode.postMessage({ command: "switchSession", conversationId: targetId });
     }
   });
 
   modelSelect.addEventListener("change", () => {
+    syncEffortOptions();
+    modelSelect.disabled = true;
+    effortSelect.disabled = true;
+    statusInfo.textContent = "Applying model...";
     vscode.postMessage({
       command: "changeModel",
       model: modelSelect.value,
@@ -504,6 +875,9 @@
   });
 
   effortSelect.addEventListener("change", () => {
+    modelSelect.disabled = true;
+    effortSelect.disabled = true;
+    statusInfo.textContent = "Applying effort...";
     vscode.postMessage({
       command: "changeModel",
       model: modelSelect.value,
@@ -517,9 +891,7 @@
 
   if (closePlanModeBtn) {
     closePlanModeBtn.addEventListener("click", () => {
-      isPlanModeActive = false;
-      if (planModePill) planModePill.classList.add("hidden");
-      chatInput.placeholder = "Ask Antigravity anything... (Type / for commands & skills)";
+      statusInfo.textContent = "Leaving Plan mode...";
       vscode.postMessage({ command: "togglePlanMode", isPlanMode: false });
     });
   }
@@ -536,38 +908,19 @@
     switch (msg.type) {
       case "initSession": {
         const session = msg.session;
-        messagesContainer.innerHTML = "";
-        activeAssistantBubble = null;
-        activeToolCards = {};
-        currentRawText = "";
+        loadedSessionMessages = session.messages || [];
+        historyLimit = 30;
 
         if (msg.config) {
           updatePermissionUI(msg.config.dangerouslySkipPermissions);
+          autoScrollEnabled = msg.config.autoScroll !== false;
         }
 
-        if (session.messages && session.messages.length > 0) {
-          session.messages.forEach((m) => {
-            if (m.role === "user") {
-              appendUserMessage(m.text);
-            } else if (m.role === "assistant") {
-              const bubble = prepareAssistantMessage();
-              currentRawText = m.text;
-              bubble.innerHTML = renderMarkdown(m.text);
-
-              if (m.toolCalls && m.toolCalls.length > 0) {
-                m.toolCalls.forEach((tc) => {
-                  updateToolCard(tc.stepIndex, tc.name, tc.state, {
-                    parameters: tc.parameters,
-                    output: tc.output
-                  });
-                });
-              }
-            }
-          });
-        }
+        renderSessionHistory();
         if (session.model) {
           modelSelect.value = session.model;
         }
+        syncEffortOptions();
         if (session.effort) {
           effortSelect.value = session.effort;
         }
@@ -577,16 +930,39 @@
 
       case "permissionChanged": {
         updatePermissionUI(msg.dangerouslySkipPermissions);
+        permToggleBtn.disabled = false;
+        statusInfo.textContent = "Ready";
+        break;
+      }
+
+      case "modelChanged": {
+        modelSelect.value = msg.model;
+        syncEffortOptions();
+        effortSelect.value = msg.effort;
+        modelSelect.disabled = false;
+        effortSelect.disabled = false;
+        statusInfo.textContent = "Ready";
+        break;
+      }
+
+      case "planModeChanged": {
+        if (planModePill) planModePill.classList.toggle("hidden", !msg.enabled);
+        chatInput.placeholder = msg.enabled
+          ? "[Plan Mode] Describe the goal you want to plan..."
+          : "Ask Antigravity anything... (Type / for commands & skills)";
+        statusInfo.textContent = "Ready";
         break;
       }
 
       case "sessionList": {
+        // Prevent triggering "change" event while updating options
+        const currentVal = msg.currentId || sessionSelect.value;
         sessionSelect.innerHTML = "";
         msg.sessions.forEach((s) => {
           const opt = document.createElement("option");
           opt.value = s.id;
           opt.textContent = s.title;
-          if (s.id === msg.currentId) {
+          if (s.id === currentVal) {
             opt.selected = true;
           }
           sessionSelect.appendChild(opt);
@@ -595,7 +971,7 @@
       }
 
       case "streamDelta": {
-        updateAssistantText(msg.delta);
+        updateAssistantText(msg.delta, msg.stepIndex);
         break;
       }
 
@@ -605,10 +981,27 @@
       }
 
       case "turnComplete": {
-        setGenerating(false);
-        if (msg.usage) {
-          statusInfo.textContent = `Tokens: ${msg.usage.total_tokens || msg.usage.output_tokens} | Duration: ${msg.result?.duration_seconds || 0}s`;
+        if (msg.result && msg.result.response && (!currentRawText || currentRawText.trim() === "")) {
+          updateAssistantText(msg.result.response, -1);
         }
+        flushAssistantText(true);
+        setGenerating(false);
+        if (msg.usage || msg.result?.usage) {
+          const u = msg.usage || msg.result?.usage;
+          statusInfo.textContent = `Tokens: ${u.total_tokens || u.output_tokens} | Duration: ${msg.result?.duration_seconds || 0}s`;
+        }
+        break;
+      }
+
+      case "turnAwaitingInput": {
+        flushAssistantText(true);
+        removeThinkingPlaceholder();
+        appendAwaitingInputActions(msg.kind);
+        setGenerating(false);
+        statusInfo.textContent = msg.kind === "confirmation"
+          ? "Waiting for plan approval"
+          : "Waiting for your answer";
+        chatInput.focus();
         break;
       }
 
@@ -617,14 +1010,34 @@
         break;
       }
 
-      case "error": {
-        setGenerating(false);
-        if (activeAssistantBubble) {
-          activeAssistantBubble.innerHTML += `<div style="color:var(--accent-red); margin-top:8px;">⚠️ ${msg.message}</div>`;
-        } else {
-          const b = prepareAssistantMessage();
-          b.innerHTML = `<div style="color:var(--accent-red)">⚠️ ${msg.message}</div>`;
+      case "turnState": {
+        if (["completed", "failed", "aborted", "awaiting_input"].includes(msg.state.phase)) setGenerating(false);
+        updateTurnState(msg.state);
+        break;
+      }
+
+      case "connectionState": {
+        const connecting = msg.state === "connecting";
+        if (!isGenerating) {
+          modelSelect.disabled = connecting;
+          effortSelect.disabled = connecting;
+          permToggleBtn.disabled = connecting;
+          newChatBtn.disabled = connecting;
+          sessionSelect.disabled = connecting;
+          statusInfo.textContent = connecting ? "Connecting..." : "Ready";
         }
+        break;
+      }
+
+      case "error": {
+        const hadActiveTurn = isGenerating;
+        setGenerating(false);
+        if (!hadActiveTurn || !activeAssistantTurn) prepareAssistantMessage(false);
+        removeThinkingPlaceholder();
+        const errorBox = document.createElement("div");
+        errorBox.className = "message-error";
+        errorBox.textContent = msg.message;
+        activeAssistantTurn.appendChild(errorBox);
         break;
       }
 

@@ -1,5 +1,7 @@
 import * as vscode from "vscode";
 import * as path from "path";
+import * as fs from "fs";
+import * as os from "os";
 import { AgyService } from "../services/agyService";
 import { SessionStore } from "../core/sessionStore";
 import { DiffContentProvider } from "../services/diffProvider";
@@ -9,7 +11,7 @@ import {
   WebviewMessage,
   StepUpdatePayload,
   ResultPayload,
-  ChatMessage,
+  SessionMeta,
   ToolCallItem,
 } from "../core/types";
 
@@ -18,6 +20,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
   private currentTurnTools: Map<number, ToolCallItem> = new Map();
   private currentAssistantText = "";
+  private currentTurnId: string | null = null;
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -46,7 +49,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     webviewView.webview.html = this.getHtmlForWebview(webviewView.webview);
 
     webviewView.webview.onDidReceiveMessage(async (data: ExtensionMessage) => {
-      await this.handleWebviewMessage(data);
+      try {
+        await this.handleWebviewMessage(data);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.postMessage({ type: "error", message });
+        this.postMessage({ type: "statusChange", status: "error" });
+      }
     });
 
     webviewView.onDidChangeVisibility(() => {
@@ -57,8 +66,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private setupAgyListeners(): void {
-    this.agyService.on("step_update", (step: StepUpdatePayload) => {
+    this.agyService.on("step_update", (step: StepUpdatePayload, turnId: string) => {
       if (!this.view) return;
+      if (this.currentTurnId && turnId !== this.currentTurnId) return;
 
       if (step.step_type === "agent_response" && step.text_delta) {
         this.currentAssistantText += step.text_delta;
@@ -83,8 +93,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           if (step.tool_info?.parameters) {
             toolCall.parameters = step.tool_info.parameters;
           }
-          if (step.tool_info?.output) {
-            toolCall.output = (toolCall.output || "") + step.tool_info.output;
+          if (step.tool_info?.output !== undefined) {
+            toolCall.output = step.tool_info.output;
           }
         }
 
@@ -98,29 +108,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     });
 
-    this.agyService.on("result", (result: ResultPayload) => {
+    this.agyService.on("result", (result: ResultPayload, turnId: string) => {
       if (!this.view) return;
-
-      // Save assistant message to current session store
-      const session = this.agyService.currentSessionMeta;
-      if (session) {
-        const assistantMsg: ChatMessage = {
-          id: "msg_" + Date.now(),
-          role: "assistant",
-          content: this.currentAssistantText || result.response || "",
-          timestamp: Date.now(),
-          toolCalls: Array.from(this.currentTurnTools.values()),
-          usage: result.usage,
-          status: result.status === "SUCCESS" ? "completed" : "error",
-        };
-
-        const messages = session.messages || [];
-        messages.push(assistantMsg);
-        if (session.id) { this.sessionStore.updateSessionMessages(session.id, messages, result.usage?.total_tokens); }
-      }
-
-      this.currentAssistantText = "";
-      this.currentTurnTools.clear();
+      if (this.currentTurnId && turnId !== this.currentTurnId) return;
+      this.saveAssistantMessage(
+        result.status === "SUCCESS" ? "completed" : "error",
+        result.response,
+        result.usage
+      );
 
       this.postMessage({
         type: "turnComplete",
@@ -128,11 +123,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         usage: result.usage,
       });
       this.postMessage({ type: "statusChange", status: "idle" });
+      this.refreshSessionList();
+    });
+
+    this.agyService.on("awaiting_input", (turnId: string, kind: import("../core/types").PendingInputKind) => {
+      if (!this.view) return;
+      if (this.currentTurnId && turnId !== this.currentTurnId) return;
+      this.saveAssistantMessage("awaiting_input", "", undefined, kind);
+      this.postMessage({ type: "turnAwaitingInput", kind });
+      this.refreshSessionList();
+    });
+
+    this.agyService.on("turn_state", (state) => {
+      if (state.phase === "submitted") this.currentTurnId = state.turnId;
+      this.postMessage({ type: "turnState", state });
     });
 
     this.agyService.on("error", (err: Error) => {
       this.currentAssistantText = "";
       this.currentTurnTools.clear();
+      this.currentTurnId = null;
       this.postMessage({ type: "error", message: err.message });
       this.postMessage({ type: "statusChange", status: "error" });
     });
@@ -140,7 +150,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.agyService.on("aborted", () => {
       this.currentAssistantText = "";
       this.currentTurnTools.clear();
+      this.currentTurnId = null;
       this.postMessage({ type: "statusChange", status: "idle" });
+    });
+
+    this.agyService.on("session_id_migrated", (oldId: string, newId: string) => {
+      this.refreshSessionList();
+    });
+
+    this.agyService.on("session_activated", () => {
+      this.refreshSessionList();
     });
   }
 
@@ -148,10 +167,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     switch (data.command) {
       case "ready": {
         const currentId = this.sessionStore.getCurrentSessionId();
-        await this.agyService.startOrSwitchSession(currentId);
+        const session = this.agyService.prepareOrSwitchSessionUI(currentId);
+        this.initSessionInWebview(session);
         this.refreshSessionList();
-        this.initCurrentSessionInWebview();
+        this.postMessage({ type: "connectionState", state: "ready" });
         this.sendSlashCommands();
+        if (session.messages.length > 0) {
+          void this.agyService.ensureProcessReady(session.id).catch((err) => {
+            this.agyService.recordDiagnostic(`ready background warmup error: ${String(err)}`);
+          });
+        }
         break;
       }
 
@@ -161,30 +186,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
 
       case "sendMessage": {
+        this.agyService.recordDiagnostic(`webview send received transitMs=${data.clientSentAt ? Math.max(0, Date.now() - data.clientSentAt) : "unknown"}`);
         let fullPrompt = data.text;
         if (data.contextCode) {
           fullPrompt = `Selected context code (${data.filePath || "active editor"}):\n\`\`\`\n${data.contextCode}\n\`\`\`\n\nUser request: ${data.text}`;
         }
 
-        const session = this.agyService.currentSessionMeta;
+        let session = this.agyService.currentSessionMeta;
+        let userMessageSaved = false;
         if (session) {
-          const userMsg: ChatMessage = {
-            id: "msg_" + Date.now(),
-            role: "user",
-            content: fullPrompt,
-            timestamp: Date.now(),
-          };
-          const messages = session.messages || [];
-          messages.push(userMsg);
-
-          // Update title from first prompt if needed
-          if (messages.length === 1 && session.title === "New Conversation") {
-            const shortTitle = data.text.slice(0, 25) + (data.text.length > 25 ? "..." : "");
-            session.title = shortTitle;
-          }
-
-          this.sessionStore.saveSession(session);
-          this.refreshSessionList();
+          this.saveUserMessage(session, fullPrompt, data.text);
+          userMessageSaved = true;
         }
 
         this.currentAssistantText = "";
@@ -192,28 +204,46 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.postMessage({ type: "statusChange", status: "running" });
 
         try {
-          await this.agyService.sendMessage(fullPrompt);
-        } catch (err: any) {
-          this.postMessage({ type: "error", message: err.message });
+          this.currentTurnId = await this.agyService.sendMessage(fullPrompt);
+          if (!userMessageSaved) {
+            session = this.agyService.currentSessionMeta;
+            if (session) this.saveUserMessage(session, fullPrompt, data.text);
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          this.postMessage({ type: "error", message });
           this.postMessage({ type: "statusChange", status: "error" });
         }
         break;
       }
 
+      case "reportRender": {
+        this.agyService.recordDiagnostic(`webview rendered kind=${data.kind} clientTime=${data.clientRenderedAt}`);
+        break;
+      }
+
+      case "openResource": {
+        try {
+          await this.openResource(data.href);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          vscode.window.showErrorMessage(`Antigravity: ${message}`);
+        }
+        break;
+      }
+
       case "abortCurrentTurn": {
-        this.agyService.abortTurn();
+        await this.agyService.abortTurn();
         break;
       }
 
       case "newSession": {
-        await this.agyService.startOrSwitchSession();
-        this.refreshSessionList();
-        this.initCurrentSessionInWebview();
+        this.createNewSession();
         break;
       }
 
       case "switchSession": {
-        await this.agyService.startOrSwitchSession(data.conversationId);
+        this.agyService.prepareOrSwitchSessionUI(data.conversationId);
         this.refreshSessionList();
         this.initCurrentSessionInWebview();
         break;
@@ -222,27 +252,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case "deleteSession": {
         this.sessionStore.deleteSession(data.conversationId);
         const nextId = this.sessionStore.getCurrentSessionId();
-        await this.agyService.startOrSwitchSession(nextId);
+        this.agyService.prepareOrSwitchSessionUI(nextId);
         this.refreshSessionList();
         this.initCurrentSessionInWebview();
         break;
       }
 
       case "changeModel": {
-        await this.agyService.setModel(data.model, data.effort);
+        const session = await this.agyService.setModel(data.model, data.effort);
         this.postMessage({
           type: "modelChanged",
-          model: data.model,
-          effort: data.effort || "high",
+          model: session?.model || data.model,
+          effort: session?.effort || data.effort || "high",
         });
         break;
       }
 
       case "togglePermission": {
-        this.agyService.setDangerouslySkipPermissions(data.dangerouslySkipPermissions);
-        // Restart session with new permission flag
-        const currentId = this.sessionStore.getCurrentSessionId();
-        await this.agyService.startOrSwitchSession(currentId);
+        await this.agyService.setDangerouslySkipPermissions(data.dangerouslySkipPermissions);
         this.postMessage({
           type: "permissionChanged",
           dangerouslySkipPermissions: data.dangerouslySkipPermissions,
@@ -250,6 +277,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         vscode.window.showInformationMessage(
           `Antigravity: Mode changed to ${data.dangerouslySkipPermissions ? "Danger Mode (Auto-run tools)" : "Safe Mode (Approval required)"}`
         );
+        break;
+      }
+
+      case "togglePlanMode": {
+        await this.agyService.setPlanMode(data.isPlanMode);
+        this.postMessage({ type: "planModeChanged", enabled: data.isPlanMode });
         break;
       }
 
@@ -328,6 +361,102 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     );
   }
 
+  public createNewSession(): void {
+    this.agyService.prepareNewSessionUI();
+    this.refreshSessionList();
+    this.initCurrentSessionInWebview();
+    this.view?.show(true);
+  }
+
+  private saveUserMessage(session: SessionMeta, content: string, titleSource: string): void {
+    const messages = session.messages || [];
+    messages.push({
+      id: `msg_${Date.now()}`,
+      role: "user",
+      content,
+      timestamp: Date.now(),
+    });
+    if (messages.length === 1 && session.title === "New Conversation") {
+      session.title = titleSource.slice(0, 25) + (titleSource.length > 25 ? "..." : "");
+    }
+    this.sessionStore.saveSession(session);
+  }
+
+  private saveAssistantMessage(
+    status: string,
+    fallbackContent = "",
+    usage?: import("../core/types").TokenUsage,
+    pendingInputKind?: import("../core/types").PendingInputKind
+  ): void {
+    const session = this.agyService.currentSessionMeta;
+    if (session) {
+      const messages = session.messages || [];
+      messages.push({
+        id: `msg_${Date.now()}`,
+        role: "assistant",
+        content: this.currentAssistantText || fallbackContent,
+        timestamp: Date.now(),
+        toolCalls: Array.from(this.currentTurnTools.values()),
+        usage,
+        status,
+        pendingInputKind,
+      });
+      this.sessionStore.updateSessionMessages(session.id, messages, usage?.total_tokens);
+    }
+    this.currentAssistantText = "";
+    this.currentTurnTools.clear();
+    this.currentTurnId = null;
+  }
+
+  private async openResource(href: string): Promise<void> {
+    if (/^https?:\/\//i.test(href)) {
+      await vscode.env.openExternal(vscode.Uri.parse(href));
+      return;
+    }
+
+    const { filePath, line } = this.resolveFileReference(href);
+    if (!filePath || !fs.existsSync(filePath)) {
+      throw new Error(`File not found: ${filePath || href}`);
+    }
+
+    const document = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
+    const options: vscode.TextDocumentShowOptions = { preview: true };
+    if (line !== undefined) {
+      const position = new vscode.Position(Math.max(0, Math.min(line - 1, document.lineCount - 1)), 0);
+      options.selection = new vscode.Range(position, position);
+    }
+    await vscode.window.showTextDocument(document, options);
+  }
+
+  private resolveFileReference(href: string): { filePath?: string; line?: number } {
+    let value = decodeURIComponent(href.trim());
+    let line: number | undefined;
+    const lineMatch = value.match(/(?:#L|:)(\d+)(?::\d+)?$/i);
+    if (lineMatch) {
+      line = Number(lineMatch[1]);
+      value = value.slice(0, lineMatch.index);
+    }
+
+    if (value.startsWith("file://")) {
+      return { filePath: vscode.Uri.parse(value).fsPath, line };
+    }
+    if (value.startsWith("~/")) value = path.join(os.homedir(), value.slice(2));
+    if (path.isAbsolute(value)) return { filePath: path.normalize(value), line };
+
+    const folders = vscode.workspace.workspaceFolders || [];
+    const activeDirectory = vscode.window.activeTextEditor?.document.uri.scheme === "file"
+      ? path.dirname(vscode.window.activeTextEditor.document.uri.fsPath)
+      : undefined;
+    const roots = [activeDirectory, ...folders.map((folder) => folder.uri.fsPath)]
+      .filter((root, index, all): root is string => Boolean(root) && all.indexOf(root) === index);
+    for (const root of roots) {
+      const candidate = path.resolve(root, value);
+      if (fs.existsSync(candidate)) return { filePath: candidate, line };
+    }
+    const root = roots[0];
+    return { filePath: root ? path.resolve(root, value) : undefined, line };
+  }
+
   private async handleContextRequest(type: "problems" | "git" | "file"): Promise<void> {
     if (type === "problems") {
       const allDiagnostics = vscode.languages.getDiagnostics();
@@ -391,16 +520,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private initCurrentSessionInWebview(): void {
     const session = this.agyService.currentSessionMeta;
+    if (session) this.initSessionInWebview(session);
+  }
+
+  private initSessionInWebview(session: SessionMeta): void {
     const config = this.agyService.getConfig();
-    if (session) {
-      this.postMessage({
-        type: "initSession",
-        session,
-        config: {
-          dangerouslySkipPermissions: config.dangerouslySkipPermissions
-        }
-      });
-    }
+    this.postMessage({
+      type: "initSession",
+      session,
+      config: {
+        dangerouslySkipPermissions: config.dangerouslySkipPermissions,
+        autoScroll: config.autoScroll,
+      },
+    });
   }
 
   private async sendSlashCommands(): Promise<void> {
@@ -412,13 +544,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  private postMessage(message: any): void {
+  private postMessage(message: WebviewMessage): void {
     if (this.view) {
       this.view.webview.postMessage(message);
     }
   }
 
   private getHtmlForWebview(webview: vscode.Webview): string {
+    const nonce = `${Date.now()}${Math.random().toString(36).slice(2)}`;
     const styleUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this.extensionUri, "media", "chat.css")
     );
@@ -434,8 +567,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource} data:; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';">
   <link href="${styleUri}" rel="stylesheet" />
-  <script src="${markedUri}"></script>
+  <script nonce="${nonce}" src="${markedUri}"></script>
   <title>Antigravity Extender</title>
 </head>
 <body>
@@ -524,7 +658,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     </div>
   </div>
 
-  <script src="${scriptUri}"></script>
+  <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>
 </html>`;
   }

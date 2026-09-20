@@ -7,6 +7,27 @@ export interface AntigravityConfig {
   includeProjectRules?: boolean;
 }
 
+export type TurnPhase =
+  | "connecting"
+  | "submitted"
+  | "waiting"
+  | "responding"
+  | "tool"
+  | "awaiting_input"
+  | "stopping"
+  | "completed"
+  | "failed"
+  | "aborted";
+
+export interface TurnState {
+  turnId: string;
+  phase: TurnPhase;
+  startedAt: number;
+  detail?: string;
+}
+
+export type PendingInputKind = "confirmation" | "question";
+
 export interface ChatMessage {
   id?: string;
   role: "user" | "assistant" | "system";
@@ -18,6 +39,7 @@ export interface ChatMessage {
   durationSeconds?: number;
   isPlanMode?: boolean;
   status?: string;
+  pendingInputKind?: PendingInputKind;
 }
 
 export interface ToolCallItem {
@@ -42,7 +64,7 @@ export interface StepUpdatePayload {
   conversation_id?: string;
   step_index: number;
   state: "ACTIVE" | "DONE" | "FAILED";
-  step_type: "user_input" | "agent_response" | "tool";
+  step_type: "user_input" | "agent_response" | "tool" | "system_message";
   tool_name?: string;
   tool_info?: {
     name: string;
@@ -86,19 +108,26 @@ export interface SlashCommandItem {
 }
 
 export type WebviewMessage =
-  | { type: "initSession"; session: SessionMeta; sessions: SessionMeta[]; models: string[]; config: AntigravityConfig; slashItems: SlashCommandItem[] }
+  | { type: "initSession"; session: SessionMeta; config: Partial<AntigravityConfig> }
   | { type: "streamDelta"; stepIndex: number; delta: string }
-  | { type: "toolUpdate"; stepIndex: number; toolName: string; state: "ACTIVE" | "DONE" | "FAILED"; info: any }
+  | { type: "toolUpdate"; stepIndex: number; toolName: string; state: "ACTIVE" | "DONE" | "FAILED"; toolInfo?: StepUpdatePayload["tool_info"] }
   | { type: "stepDone"; stepIndex: number; usage?: TokenUsage }
-  | { type: "turnComplete"; result: ResultPayload }
-  | { type: "sessionList"; sessions: SessionMeta[]; currentSessionId: string }
+  | { type: "turnComplete"; result: ResultPayload; usage?: TokenUsage }
+  | { type: "turnAwaitingInput"; kind: PendingInputKind }
+  | { type: "sessionList"; sessions: Array<Pick<SessionMeta, "id" | "title" | "updatedAt">>; currentId: string }
   | { type: "statusChange"; status: "idle" | "running" | "error"; error?: string }
+  | { type: "turnState"; state: TurnState }
   | { type: "error"; message: string }
-  | { type: "slashCommands"; items: SlashCommandItem[] };
+  | { type: "slashCommands"; commands: SlashCommandItem[] }
+  | { type: "connectionState"; state: "connecting" | "ready" }
+  | { type: "permissionChanged"; dangerouslySkipPermissions: boolean }
+  | { type: "modelChanged"; model: string; effort: string }
+  | { type: "planModeChanged"; enabled: boolean }
+  | { type: "setContext"; code: string; file?: string; lineCount?: number; title?: string };
 
 export type ExtensionMessage =
   | { command: "ready" }
-  | { command: "sendMessage"; text: string; isPlanMode?: boolean; contextCode?: string; filePath?: string }
+  | { command: "sendMessage"; text: string; clientSentAt?: number; isPlanMode?: boolean; contextCode?: string; filePath?: string }
   | { command: "abortCurrentTurn" }
   | { command: "newSession" }
   | { command: "switchSession"; conversationId: string }
@@ -106,6 +135,7 @@ export type ExtensionMessage =
   | { command: "changeModel"; model: string; effort: "low" | "medium" | "high" }
   | { command: "toggleDangerousPermissions"; enabled: boolean }
   | { command: "togglePermission"; dangerouslySkipPermissions: boolean }
+  | { command: "togglePlanMode"; isPlanMode: boolean }
   | { command: "insertAtCursor"; text?: string; code?: string }
   | { command: "applyDiff"; text?: string; code?: string; filePath?: string }
   | { command: "viewDiff"; text?: string; code?: string; filePath?: string }
@@ -116,6 +146,13 @@ export type ExtensionMessage =
   | { command: "requestFileContext" }
   | { command: "requestContext"; contextType: "problems" | "file" }
   | { command: "openSettings" }
-  | { command: "getSlashCommands" };
+  | { command: "getSlashCommands" }
+  | { command: "reportRender"; kind: "firstText"; clientRenderedAt: number }
+  | { command: "openResource"; href: string };
 
-export type AgyIncomingEvent = any;
+export type AgyIncomingEvent =
+  | { event: "init"; conversation_id: string; init?: Record<string, unknown> }
+  | { event: "step_update"; step_update: StepUpdatePayload }
+  | { event: "result"; result: ResultPayload }
+  | { event: "error"; error: { message: string; code?: string } }
+  | { event: string; [key: string]: unknown };
