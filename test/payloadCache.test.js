@@ -1,0 +1,23 @@
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const { PayloadCache } = require("../out/core/payloadCache");
+test("optional payload LRU respects count and bytes, updates recency and releases originals", () => {
+  const c = new PayloadCache(2, 100, (value) => value.length * 2);
+  c.set("a", "a".repeat(10));
+  c.set("b", "b".repeat(10));
+  assert.equal(c.get("a"), "a".repeat(10));
+  c.set("c", "c".repeat(10));
+  assert.equal(c.get("b"), undefined);
+  assert.equal(c.stats.entries, 2);
+  assert.equal(c.stats.evictions, 1);
+  c.set("large", "x".repeat(100));
+  assert.equal(c.get("large"), undefined);
+  c.set("a", "a".repeat(40));
+  assert(c.stats.estimatedBytes <= 100);
+  assert.equal(c.get("c"), undefined);
+  assert.equal(c.get("a").length, 40);
+  c.clear();
+  assert.equal(c.stats.entries, 0);
+  assert.equal(c.stats.estimatedBytes, 0);
+  assert.throws(() => new PayloadCache(-1, 1, () => 0), /Invalid/);
+});

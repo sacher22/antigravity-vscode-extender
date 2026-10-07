@@ -1,0 +1,15 @@
+{
+  "passed": false,
+  "version": "2.5.2",
+  "environment": "Windows VS Code + WSL actual installed extension; deterministic acceptance CLI",
+  "steps": [
+    "actual installed 2.5.2 loaded"
+  ],
+  "scripts": [
+    "https://vscode-remote+wsl-002bubuntu-002d24-002e04.vscode-resource.vscode-cdn.net/home/ubuntu/.vscode-server/extensions/antigravity.antigravity-vscode-extender-2.5.2/media/chat.js"
+  ],
+  "sessionIds": [
+    "sess_df9b057e-6ae9-46be-a2ec-f3e398090733"
+  ],
+  "error": "locator.waitFor: Timeout 30000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('#approve-plan-btn') to be visible\u001b[22m\n\n    at C:\\Users\\Public\\agy252-acceptance\\accept.cjs:13:126"
+}

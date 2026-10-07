@@ -1,3 +1,11 @@
+import { decodeImage, storeImage } from "../conversation/imageStore";
+import { contextItems } from "../core/contextAttachments";
+import { IMAGE_MAX_COUNT, IMAGE_TOTAL_BYTES } from "../core/imageAttachments";
+import { RequestReceiptLedger } from "./requestReceiptLedger";
+import { EditorActions } from "./editorActions";
+import { WebviewCommandDispatcher } from "./commandDispatcher";
+import { ContextAdapter } from "./contextAdapter";
+import { RenderTelemetryBridge } from "./renderTelemetryBridge";
 import * as vscode from "vscode";
 import * as path from "path";
 import * as fs from "fs";
@@ -5,38 +13,116 @@ import * as os from "os";
 import { AgyService } from "../services/agyService";
 import { SessionStore } from "../core/sessionStore";
 import { DiffContentProvider } from "../services/diffProvider";
-import { SlashCommandResolver } from "../core/slashCommands";
+import { WebviewBridge } from "./webviewBridge";
 import {
-  ExtensionMessage,
-  WebviewMessage,
-  StepUpdatePayload,
-  ResultPayload,
-  SessionMeta,
-  ToolCallItem,
-} from "../core/types";
+  commandRegistry,
+  parseCommand,
+  validateCommand,
+  commandDescription,
+} from "../commands/registry";
+import type { ContextAttachment } from "../core/types";
+import { gitChanges } from "../adapters/gitChanges";
+import { cliCapabilities } from "../core/cliCapabilities";
+import { NativeManagementAdapter } from "../adapters/nativeManagement";
+import { schemaValidator } from "../core/schemaValidation";
+import { ExtensionMessage, WebviewMessage, SessionMeta } from "../core/types";
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = "antigravity.chatView";
   private view?: vscode.WebviewView;
-  private currentTurnTools: Map<number, ToolCallItem> = new Map();
-  private currentAssistantText = "";
-  private currentTurnId: string | null = null;
+  private readonly bridge: WebviewBridge;
+  private readonly management = new NativeManagementAdapter();
+  private readonly editorActions: EditorActions;
+  private readonly dispatcher: WebviewCommandDispatcher;
+  private readonly contextAdapter: ContextAdapter;
+  private disposed = false;
+  private readonly renderTelemetry: RenderTelemetryBridge;
 
+  private readonly requestReceipts = new RequestReceiptLedger();
+  private requestViewEpoch = 0;
+  private observeRequest(data: ExtensionMessage): void {
+    if (
+      !this.view ||
+      this.view.visible === false ||
+      this.disposed ||
+      !data.requestTiming ||
+      !["sendMessage", "abortCurrentTurn"].includes(data.command) ||
+      data.sessionId !== this.agyService.currentSessionMeta?.id
+    )
+      return;
+    const probe = this.requestReceipts.issue({
+      requestId: data.requestId!,
+      viewEpoch: this.requestViewEpoch,
+      command: data.command as "sendMessage" | "abortCurrentTurn",
+      sessionId: data.sessionId,
+      ...(data.command === "abortCurrentTurn"
+        ? { turnId: this.agyService.executionTarget().activeTurnState?.turnId }
+        : {}),
+      uiQueuedMs: data.requestTiming.uiQueuedMs,
+    });
+    this.postMessage({ type: "requestObserved", probe });
+  }
   constructor(
     private readonly extensionUri: vscode.Uri,
     private readonly agyService: AgyService,
     private readonly sessionStore: SessionStore,
-    private readonly diffProvider: DiffContentProvider
+    private readonly diffProvider: DiffContentProvider,
   ) {
+    this.renderTelemetry = new RenderTelemetryBridge(
+      (measurement) => this.agyService.recordRender(measurement),
+      (turnId, kind) => this.agyService.markRenderPost(turnId, kind),
+    );
+    this.bridge = new WebviewBridge(
+      (data) => this.handleWebviewMessage(data),
+      (message) => this.postMessage(message),
+      () => this.agyService.currentSessionMeta?.id,
+      (data) => this.observeRequest(data),
+    );
     this.setupAgyListeners();
+    this.editorActions = new EditorActions(
+      () => this.agyService.currentSessionMeta,
+      this.diffProvider,
+      (message) => this.postMessage(message),
+    );
+    this.contextAdapter = new ContextAdapter(
+      () => this.agyService.currentSessionMeta,
+      () => this.agyService.prepareOrSwitchSessionUI(),
+      (sessionId, attachment) => this.saveContext(sessionId, attachment),
+    );
+    this.dispatcher = new WebviewCommandDispatcher({
+      service: this.agyService,
+      editorActions: this.editorActions,
+      executeSlash: (...args) => this.executeSlash(...args),
+      pickHistory: () => this.pickHistory(),
+      publishCommands: () => this.publishCommands(),
+      openResource: (href) => this.openResource(href),
+      confirmRunningDelete: async () =>
+        (await vscode.window.showWarningMessage(
+          "该对话仍在运行。停止任务并删除记录？",
+          { modal: true },
+          "停止并删除",
+        )) === "停止并删除",
+      requestContext: (type) => this.handleContextRequest(type),
+      copy: (text) => vscode.env.clipboard.writeText(text),
+      openWorkspace: () =>
+        vscode.commands.executeCommand("workbench.action.files.openFolder"),
+      openSettings: () =>
+        vscode.commands.executeCommand(
+          "workbench.action.openSettings",
+          "antigravity",
+        ),
+    });
   }
 
   public resolveWebviewView(
     webviewView: vscode.WebviewView,
     _context: vscode.WebviewViewResolveContext,
-    _token: vscode.CancellationToken
+    _token: vscode.CancellationToken,
   ): void {
     this.view = webviewView;
+    const viewEpoch = this.renderTelemetry.newView();
+    this.requestViewEpoch = viewEpoch;
+    this.requestReceipts.clear();
 
     webviewView.webview.options = {
       enableScripts: true,
@@ -48,618 +134,778 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     webviewView.webview.html = this.getHtmlForWebview(webviewView.webview);
 
-    webviewView.webview.onDidReceiveMessage(async (data: ExtensionMessage) => {
-      try {
-        await this.handleWebviewMessage(data);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        this.postMessage({ type: "error", message });
-        this.postMessage({ type: "statusChange", status: "error" });
+    const receiver = webviewView.webview.onDidReceiveMessage((data) => {
+      if (this.view !== webviewView || this.disposed) return;
+      if (data?.command === "reportRequestLatency") {
+        const measurement = this.requestReceipts.accept(
+          data.receipt,
+          viewEpoch,
+        );
+        if (measurement) this.agyService.recordRequest(measurement);
+        return;
       }
+      if (data?.command === "reportRender") {
+        this.renderTelemetry.accept(
+          data.receipt,
+          viewEpoch,
+          this.agyService.currentSessionMeta?.id,
+          webviewView.visible !== false,
+        );
+        return;
+      }
+      void this.bridge.receive(data);
     });
 
-    webviewView.onDidChangeVisibility(() => {
+    const visibility = webviewView.onDidChangeVisibility(() => {
+      if (this.view !== webviewView || this.disposed) return;
+      if (!webviewView.visible) {
+        this.agyService.watchAgents(false);
+        this.renderTelemetry.hidden();
+        this.requestReceipts.clear();
+      }
       if (webviewView.visible) {
-        this.refreshSessionList();
+        this.agyService.sendSnapshot();
+      }
+    });
+    webviewView.onDidDispose(() => {
+      receiver.dispose();
+      visibility.dispose();
+      if (this.view === webviewView) {
+        this.agyService.watchAgents(false);
+        this.renderTelemetry.clear();
+        this.requestReceipts.clear();
+        this.view = undefined;
       }
     });
   }
 
   private setupAgyListeners(): void {
-    this.agyService.on("step_update", (step: StepUpdatePayload, turnId: string) => {
-      if (!this.view) return;
-      if (this.currentTurnId && turnId !== this.currentTurnId) return;
-
-      if (step.step_type === "agent_response" && step.text_delta) {
-        this.currentAssistantText += step.text_delta;
-        this.postMessage({
-          type: "streamDelta",
-          stepIndex: step.step_index,
-          delta: step.text_delta,
-        });
-      } else if (step.step_type === "tool" && step.tool_name) {
-        let toolCall = this.currentTurnTools.get(step.step_index);
-        if (!toolCall) {
-          toolCall = {
-            stepIndex: step.step_index,
-            name: step.tool_name,
-            state: step.state as "ACTIVE" | "DONE" | "FAILED",
-            parameters: step.tool_info?.parameters,
-            output: step.tool_info?.output,
-          };
-          this.currentTurnTools.set(step.step_index, toolCall);
-        } else {
-          toolCall.state = step.state as "ACTIVE" | "DONE" | "FAILED";
-          if (step.tool_info?.parameters) {
-            toolCall.parameters = step.tool_info.parameters;
-          }
-          if (step.tool_info?.output !== undefined) {
-            toolCall.output = step.tool_info.output;
-          }
-        }
-
-        this.postMessage({
-          type: "toolUpdate",
-          stepIndex: step.step_index,
-          toolName: step.tool_name,
-          state: step.state as "ACTIVE" | "DONE" | "FAILED",
-          toolInfo: step.tool_info,
-        });
-      }
-    });
-
-    this.agyService.on("result", (result: ResultPayload, turnId: string) => {
-      if (!this.view) return;
-      if (this.currentTurnId && turnId !== this.currentTurnId) return;
-      this.saveAssistantMessage(
-        result.status === "SUCCESS" ? "completed" : "error",
-        result.response,
-        result.usage
-      );
-
-      this.postMessage({
-        type: "turnComplete",
-        result,
-        usage: result.usage,
-      });
-      this.postMessage({ type: "statusChange", status: "idle" });
-      this.refreshSessionList();
-    });
-
-    this.agyService.on("awaiting_input", (turnId: string, kind: import("../core/types").PendingInputKind) => {
-      if (!this.view) return;
-      if (this.currentTurnId && turnId !== this.currentTurnId) return;
-      this.saveAssistantMessage("awaiting_input", "", undefined, kind);
-      this.postMessage({ type: "turnAwaitingInput", kind });
-      this.refreshSessionList();
-    });
-
-    this.agyService.on("turn_state", (state) => {
-      if (state.phase === "submitted") this.currentTurnId = state.turnId;
-      this.postMessage({ type: "turnState", state });
-    });
-
-    this.agyService.on("error", (err: Error) => {
-      this.currentAssistantText = "";
-      this.currentTurnTools.clear();
-      this.currentTurnId = null;
-      this.postMessage({ type: "error", message: err.message });
-      this.postMessage({ type: "statusChange", status: "error" });
-    });
-
-    this.agyService.on("aborted", () => {
-      this.currentAssistantText = "";
-      this.currentTurnTools.clear();
-      this.currentTurnId = null;
-      this.postMessage({ type: "statusChange", status: "idle" });
-    });
-
-    this.agyService.on("session_id_migrated", (oldId: string, newId: string) => {
-      this.refreshSessionList();
-    });
-
-    this.agyService.on("session_activated", () => {
-      this.refreshSessionList();
-    });
-  }
-
-  private async handleWebviewMessage(data: ExtensionMessage): Promise<void> {
-    switch (data.command) {
-      case "ready": {
-        const currentId = this.sessionStore.getCurrentSessionId();
-        const session = this.agyService.prepareOrSwitchSessionUI(currentId);
-        this.initSessionInWebview(session);
-        this.refreshSessionList();
-        this.postMessage({ type: "connectionState", state: "ready" });
-        this.sendSlashCommands();
-        if (session.messages.length > 0) {
-          void this.agyService.ensureProcessReady(session.id).catch((err) => {
-            this.agyService.recordDiagnostic(`ready background warmup error: ${String(err)}`);
-          });
-        }
-        break;
-      }
-
-      case "getSlashCommands": {
-        this.sendSlashCommands();
-        break;
-      }
-
-      case "sendMessage": {
-        this.agyService.recordDiagnostic(`webview send received transitMs=${data.clientSentAt ? Math.max(0, Date.now() - data.clientSentAt) : "unknown"}`);
-        let fullPrompt = data.text;
-        if (data.contextCode) {
-          fullPrompt = `Selected context code (${data.filePath || "active editor"}):\n\`\`\`\n${data.contextCode}\n\`\`\`\n\nUser request: ${data.text}`;
-        }
-
-        let session = this.agyService.currentSessionMeta;
-        let userMessageSaved = false;
-        if (session) {
-          this.saveUserMessage(session, fullPrompt, data.text);
-          userMessageSaved = true;
-        }
-
-        this.currentAssistantText = "";
-        this.currentTurnTools.clear();
-        this.postMessage({ type: "statusChange", status: "running" });
-
-        try {
-          this.currentTurnId = await this.agyService.sendMessage(fullPrompt);
-          if (!userMessageSaved) {
-            session = this.agyService.currentSessionMeta;
-            if (session) this.saveUserMessage(session, fullPrompt, data.text);
-          }
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          this.postMessage({ type: "error", message });
-          this.postMessage({ type: "statusChange", status: "error" });
-        }
-        break;
-      }
-
-      case "reportRender": {
-        this.agyService.recordDiagnostic(`webview rendered kind=${data.kind} clientTime=${data.clientRenderedAt}`);
-        break;
-      }
-
-      case "openResource": {
-        try {
-          await this.openResource(data.href);
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          vscode.window.showErrorMessage(`Antigravity: ${message}`);
-        }
-        break;
-      }
-
-      case "abortCurrentTurn": {
-        await this.agyService.abortTurn();
-        break;
-      }
-
-      case "newSession": {
-        this.createNewSession();
-        break;
-      }
-
-      case "switchSession": {
-        this.agyService.prepareOrSwitchSessionUI(data.conversationId);
-        this.refreshSessionList();
-        this.initCurrentSessionInWebview();
-        break;
-      }
-
-      case "deleteSession": {
-        this.sessionStore.deleteSession(data.conversationId);
-        const nextId = this.sessionStore.getCurrentSessionId();
-        this.agyService.prepareOrSwitchSessionUI(nextId);
-        this.refreshSessionList();
-        this.initCurrentSessionInWebview();
-        break;
-      }
-
-      case "changeModel": {
-        const session = await this.agyService.setModel(data.model, data.effort);
-        this.postMessage({
-          type: "modelChanged",
-          model: session?.model || data.model,
-          effort: session?.effort || data.effort || "high",
-        });
-        break;
-      }
-
-      case "togglePermission": {
-        await this.agyService.setDangerouslySkipPermissions(data.dangerouslySkipPermissions);
-        this.postMessage({
-          type: "permissionChanged",
-          dangerouslySkipPermissions: data.dangerouslySkipPermissions,
-        });
-        vscode.window.showInformationMessage(
-          `Antigravity: Mode changed to ${data.dangerouslySkipPermissions ? "Danger Mode (Auto-run tools)" : "Safe Mode (Approval required)"}`
-        );
-        break;
-      }
-
-      case "togglePlanMode": {
-        await this.agyService.setPlanMode(data.isPlanMode);
-        this.postMessage({ type: "planModeChanged", enabled: data.isPlanMode });
-        break;
-      }
-
-      case "viewDiff": {
-        await this.showDiffView(data.code || "", data.filePath);
-        break;
-      }
-
-      case "requestContext": {
-        await this.handleContextRequest(data.contextType);
-        break;
-      }
-
-      case "applyCodeToEditor": {
-        const editor = vscode.window.activeTextEditor;
-        if (editor) {
-          const selection = editor.selection;
-          await editor.edit((editBuilder) => {
-            if (selection.isEmpty) {
-              // Replace entire document if no selection
-              const fullRange = new vscode.Range(
-                editor.document.positionAt(0),
-                editor.document.positionAt(editor.document.getText().length)
-              );
-              editBuilder.replace(fullRange, data.code || "");
-            } else {
-              editBuilder.replace(selection, data.code || "");
-            }
-          });
-          vscode.window.showInformationMessage("Antigravity: Code applied to editor!");
-        } else {
-          // Open untitled document
-          const doc = await vscode.workspace.openTextDocument({
-            content: data.code,
-            language: "typescript",
-          });
-          await vscode.window.showTextDocument(doc);
-        }
-        break;
-      }
-
-      case "copyToClipboard": {
-        await vscode.env.clipboard.writeText(data.text);
-        break;
-      }
-
-      case "openSettings": {
-        vscode.commands.executeCommand("workbench.action.openSettings", "antigravity");
-        break;
-      }
-    }
-  }
-
-  private async showDiffView(newCode: string, filePath?: string): Promise<void> {
-    const editor = vscode.window.activeTextEditor;
-    let originalUri: vscode.Uri | undefined = editor?.document.uri;
-
-    if (filePath && vscode.workspace.workspaceFolders) {
-      originalUri = vscode.Uri.file(path.resolve(vscode.workspace.workspaceFolders[0].uri.fsPath, filePath));
-    }
-
-    if (!originalUri) {
-      vscode.window.showWarningMessage("No open file to diff against.");
-      return;
-    }
-
-    const originalFileName = path.basename(originalUri.fsPath);
-    const diffUri = vscode.Uri.parse(`${DiffContentProvider.scheme}:/${originalFileName}-generated.tmp`);
-    this.diffProvider.setContent(diffUri, newCode);
-
-    await vscode.commands.executeCommand(
-      "vscode.diff",
-      originalUri,
-      diffUri,
-      `${originalFileName} ↔ Antigravity Suggested Changes`
+    this.agyService.on("message", (message: WebviewMessage) =>
+      this.postMessage(message),
     );
   }
 
-  public createNewSession(): void {
-    this.agyService.prepareNewSessionUI();
-    this.refreshSessionList();
-    this.initCurrentSessionInWebview();
+  private imageQueue: Promise<void> = Promise.resolve();
+  private handleWebviewMessage(data: ExtensionMessage): Promise<void> {
+    if (data.command === "pasteImage") {
+      const result = this.imageQueue.then(async () => {
+        if (this.disposed) throw new Error("侧栏已关闭。");
+        const session =
+          this.agyService.currentSessionMeta ||
+          this.agyService.prepareOrSwitchSessionUI();
+        if (session.id !== data.sessionId)
+          throw new Error("会话已切换，请重新粘贴截图。");
+        const existing = contextItems(session.attachment).flatMap((item) =>
+          item.image ? [item.image] : [],
+        );
+        const bytes = decodeImage(data.image).length;
+        if (
+          existing.length >= IMAGE_MAX_COUNT ||
+          existing.reduce((sum, item) => sum + item.bytes, 0) + bytes >
+            IMAGE_TOTAL_BYTES
+        )
+          throw new Error("每条消息最多 4 张图片，总计不超过 10 MiB。");
+        const directory = this.sessionStore.imageDirectory(session.id);
+        const image = await storeImage(directory, data.image);
+        if (
+          this.disposed ||
+          this.agyService.currentSessionMeta?.id !== session.id
+        )
+          throw new Error("会话已切换，截图没有添加到新会话。");
+        session.imageDirectory = directory;
+        await this.contextAdapter.sendCodeContext(
+          `用户粘贴的图片文件：${JSON.stringify(image.file)}。请使用 view_file 图片查看工具读取实际图像后回答；如果无法查看，请明确说明，不要猜测图片内容。`,
+          image.file,
+          undefined,
+          "截图",
+          { image, uri: vscode.Uri.file(image.file).toString() },
+        );
+      });
+      this.imageQueue = result.catch(() => {});
+      return result;
+    }
+
+    return this.dispatcher.dispatch(data);
+  }
+
+  public dispose() {
+    this.disposed = true;
+    this.renderTelemetry.clear();
+    this.requestReceipts.clear();
+    this.contextAdapter.dispose();
+    this.editorActions.dispose();
+  }
+  public async createNewSession(): Promise<void> {
+    await this.agyService.newSession();
     this.view?.show(true);
   }
 
-  private saveUserMessage(session: SessionMeta, content: string, titleSource: string): void {
-    const messages = session.messages || [];
-    messages.push({
-      id: `msg_${Date.now()}`,
-      role: "user",
-      content,
-      timestamp: Date.now(),
-    });
-    if (messages.length === 1 && session.title === "New Conversation") {
-      session.title = titleSource.slice(0, 25) + (titleSource.length > 25 ? "..." : "");
-    }
-    this.sessionStore.saveSession(session);
+  public async sendFromEditor(prompt: string): Promise<void> {
+    await vscode.commands.executeCommand(
+      "workbench.view.extension.antigravity-sidebar",
+    );
+    await this.agyService.sendMessage(prompt);
   }
 
-  private saveAssistantMessage(
-    status: string,
-    fallbackContent = "",
-    usage?: import("../core/types").TokenUsage,
-    pendingInputKind?: import("../core/types").PendingInputKind
-  ): void {
-    const session = this.agyService.currentSessionMeta;
-    if (session) {
-      const messages = session.messages || [];
-      messages.push({
-        id: `msg_${Date.now()}`,
-        role: "assistant",
-        content: this.currentAssistantText || fallbackContent,
-        timestamp: Date.now(),
-        toolCalls: Array.from(this.currentTurnTools.values()),
-        usage,
-        status,
-        pendingInputKind,
+  private publishCommands() {
+    const root =
+      this.agyService.currentSessionMeta?.workspaceRoot ||
+      vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const skills = root ? this.management.skills(root) : [];
+    this.postMessage({
+      type: "slashCommands",
+      commands: [
+        ...commandRegistry.map((c) => ({
+          command: "/" + c.name,
+          label: c.usage,
+          description: commandDescription(c),
+          category: "General" as const,
+          origin: c.route,
+        })),
+        ...skills
+          .filter(
+            (s) =>
+              !commandRegistry.some(
+                (c) => c.name === s.name || c.aliases?.includes(s.name),
+              ),
+          )
+          .map((s) => ({
+            command: "/" + s.name,
+            label: "/" + s.name,
+            description: `原生技能 · ${s.origin}`,
+            category: "Skills" as const,
+            origin: "skill",
+          })),
+      ],
+    });
+  }
+  private async pickHistory(): Promise<void> {
+    const origin = this.agyService.currentSessionMeta?.id;
+    const sessions = this.sessionStore.getAllSessions();
+    const selected = await vscode.window.showQuickPick(
+      sessions.map((session) => ({
+        label: session.title,
+        description: session.id,
+        detail: session.workspaceRoot || "旧记录未提供目录",
+        sessionId: session.id,
+      })),
+      {
+        placeHolder: `搜索全部历史对话（${sessions.length}）`,
+        matchOnDescription: true,
+        matchOnDetail: true,
+      },
+    );
+    if (!selected) return;
+    if (this.agyService.currentSessionMeta?.id !== origin)
+      throw new Error("会话已切换，本次历史选择已取消。");
+    await this.agyService.switchSession(selected.sessionId);
+  }
+  private async executeSlash(
+    text: string,
+    requestId?: string,
+    context?: { code?: string; file?: string },
+  ): Promise<boolean> {
+    if (!text.trimStart().startsWith("/") || text.trimStart().startsWith("//"))
+      return false;
+    const service = this.agyService;
+    const s = service.currentSessionMeta || service.prepareOrSwitchSessionUI();
+    const executor = service.executionTarget();
+    const root =
+      s?.workspaceRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const skills = root ? this.management.skills(root) : [];
+    const parsed = parseCommand(
+      text,
+      skills.map((skill) => ({
+        name: skill.name,
+        description: "原生技能",
+        usage: `/${skill.name}`,
+        route: "skill",
+      })),
+    );
+    if (!parsed) return false;
+    const withContext = (prompt: string) =>
+      context?.code
+        ? `${prompt}\n\nSelected context (${context.file || "attached files/selections"}):\n\`\`\`\n${context.code}\n\`\`\``
+        : prompt;
+    const { spec, args, tail } = parsed;
+    const name = spec.name;
+    const requireCurrent = () => {
+      if (service.currentSessionMeta?.id !== s.id)
+        throw new Error("会话已切换，本次命令不会修改新会话。");
+    };
+    const result = (value: string, targetSessionId = s.id) =>
+      this.postMessage({
+        type: "commandResult",
+        title: spec.usage,
+        text: value,
+        requestId,
+        sessionId: targetSessionId,
       });
-      this.sessionStore.updateSessionMessages(session.id, messages, usage?.total_tokens);
+    const native = async (command = text) => {
+      const targetSessionId = await service.openNativeCli();
+      result(
+        executor.nativeHandoffMode === "standalone"
+          ? `已打开独立原生终端，未复用侧栏会话或模型/模式参数，请核对原生配置。${command !== "/cli" ? "请在终端输入：" + command : ""}该版本记录协议未验证，不会导入新增回答。`
+          : command === "/cli"
+            ? "已交接到原生 CLI；可在终端使用原生命令。关闭终端后从历史恢复。"
+            : `已交接到原生 CLI。请在终端输入：${command}\n关闭终端后可切回历史并输入 /history sync 同步新增可见文字。`,
+        targetSessionId,
+      );
+    };
+    validateCommand(parsed, { busy: service.processing, plan: !!s.planMode });
+    const run = (parameters: string[], cached = false) =>
+      this.management.run(
+        service.getConfig().cliPath,
+        root || os.homedir(),
+        parameters,
+        cached,
+      );
+    switch (name) {
+      case "help":
+        result(
+          commandRegistry
+            .map((c) => `${c.usage} · ${commandDescription(c)}`)
+            .join("\n") +
+            "\n\n// 开头发送普通文字；原生终端命令不会自动执行。技能发现不覆盖全部插件声明，CLI 决定加载优先级。输入 /skills 查看已发现技能。",
+        );
+        break;
+      case "new":
+        await service.newSession();
+        break;
+      case "stop":
+        await executor.abortTurn();
+        break;
+      case "history":
+        if (args[0] === "search") await this.pickHistory();
+        else if (args[0] === "sync") await executor.syncNativeHistory();
+        else if (args[0]) await service.switchSession(args[0]);
+        else
+          result(
+            this.sessionStore
+              .getAllSessions()
+              .map((c) => `${c.id} · ${c.title}`)
+              .join("\n") || "暂无历史。",
+          );
+        break;
+      case "plan":
+        if (tail === "off") await executor.setPlanMode(false);
+        else {
+          await executor.setPlanMode(true);
+          requireCurrent();
+          if (tail)
+            await executor.sendMessage(withContext(tail), requestId, text);
+        }
+        break;
+      case "approve":
+        if (!s?.messages.at(-1)?.id) throw new Error("没有可批准方案。");
+        await executor.approvePlan(s.messages.at(-1)!.id!);
+        break;
+      case "parallel":
+        await executor.sendMessage(
+          withContext("多 Agent 并行执行以下任务：\n" + tail),
+          requestId,
+          text,
+          true,
+        );
+        break;
+      case "model": {
+        const output = await run(["models"], args[0] !== "refresh");
+        const models = output
+          .split(/\r?\n/)
+          .map((l) => l.split(/\s/)[0])
+          .filter((m) => /^[-a-zA-Z0-9_.]+$/.test(m) && m.includes("-"));
+        this.postMessage({ type: "models", models, sessionId: s?.id });
+        requireCurrent();
+        if (args[0] && args[0] !== "refresh") {
+          if (!models.includes(args[0]))
+            throw new Error("原生 CLI 模型列表没有此 ID。");
+          await executor.setModel(
+            args[0],
+            args[0].match(/-(low|medium|high)$/)?.[1] || s?.effort,
+          );
+        } else result(output);
+        break;
+      }
+      case "effort":
+        if (!args.length)
+          result(`当前思考深度：${s?.effort}。max 仅支持原生兼容模型。`);
+        else {
+          await executor.setModel(s!.model, args[0]);
+        }
+        break;
+      case "agents":
+        result(await run(["agents"], true));
+        break;
+      case "agent":
+        if (!args.length)
+          result(
+            `当前主 Agent：${s?.customAgent || "默认"}\nPlan 固定只读 Agent。/agents 列出原生定义；/subagents 查看子代理。`,
+          );
+        else {
+          if (args[0] !== "default") {
+            const available = await run(["agents"], true);
+            requireCurrent();
+            if (
+              !available
+                .split(/\r?\n/)
+                .some((l) => l.trim().split(/\s/)[0] === args[0])
+            )
+              throw new Error("原生 CLI 没有此 Agent 定义。");
+            if (args[0] === "agy-extender-plan-readonly")
+              throw new Error("请用 /plan 启用专用只读 Agent。");
+          }
+          await executor.setExecutionOptions({
+            customAgent: args[0] === "default" ? undefined : args[0],
+          });
+        }
+        break;
+      case "subagents":
+        this.postMessage({ type: "showAgents", sessionId: s?.id });
+        break;
+      case "subagent":
+        if (!s?.agents?.some((a) => a.id === args[0]))
+          throw new Error("当前会话不存在此子代理。");
+        this.postMessage({
+          type: "showAgents",
+          sessionId: s.id,
+          agentId: args[0],
+        });
+        break;
+      case "open":
+        await this.openResource(args[0]);
+        break;
+      case "copy":
+        await vscode.env.clipboard.writeText(
+          executor.copyText(args[0] === "loaded" ? "loaded" : "last"),
+        );
+        result(
+          args[0] === "loaded"
+            ? "已复制当前已加载的聊天正文；工具原文在各工具详情中查看。"
+            : "已复制完整最近回答。",
+        );
+        break;
+      case "context":
+        await this.handleContextRequest(
+          args[0] as "file" | "selection" | "problems",
+        );
+        break;
+      case "diff":
+        result(await this.gitChanges(root, true));
+        break;
+      case "edited":
+        result(await this.gitChanges(root));
+        break;
+      case "workspace":
+        result(
+          JSON.stringify(
+            {
+              root,
+              cliVersion:
+                executor.currentExecutionProfile?.capabilities?.version,
+              cliProtocolStatus:
+                executor.currentExecutionProfile?.capabilities?.status,
+              requestedModel: executor.currentExecutionProfile?.requestedModel,
+              effectiveModel: executor.currentExecutionProfile?.options.model,
+              directories: s?.workspaceDirectories,
+              additionalDirectories: s?.extraDirectories,
+              model: s?.model,
+              effort: s?.effort,
+              agent: s?.customAgent || "default",
+              sandbox: !!s?.sandbox,
+              schema: s?.schemaPath,
+              mode: s?.planMode ? "只读 Plan" : "普通",
+            },
+            null,
+            2,
+          ),
+        );
+        break;
+      case "add-dir":
+        {
+          if (!root) throw new Error("请先在 VS Code 打开文件夹。");
+          const directory = this.commandPath(args[0], root);
+          if (!fs.statSync(directory).isDirectory())
+            throw new Error("附加路径必须是目录。");
+          await executor.setExecutionOptions({
+            extraDirectories: Array.from(
+              new Set([...(s?.extraDirectories || []), directory]),
+            ),
+          });
+          result(
+            `当前会话已添加目录：${directory}。CLI 工具可能读取或修改此目录。`,
+          );
+        }
+        break;
+      case "sandbox":
+        await executor.setExecutionOptions({ sandbox: args[0] === "on" });
+        result(
+          "设置已保存；下轮使用原生 --sandbox，具体限制由 CLI 实施，不代表 OS 隔离。",
+        );
+        break;
+      case "schema":
+        {
+          let schemaPath: string | undefined;
+          if (args[0] !== "off") {
+            if (!root) throw new Error("请先打开项目。");
+            schemaPath = this.commandPath(args[0], root);
+            if (fs.statSync(schemaPath).size > 256 * 1024)
+              throw new Error("Schema 文件超过 256 KiB。");
+            schemaValidator(schemaPath);
+            const schema = JSON.parse(fs.readFileSync(schemaPath, "utf8"));
+            if (
+              typeof schema !== "boolean" &&
+              (!schema || typeof schema !== "object" || Array.isArray(schema))
+            )
+              throw new Error("无效 JSON Schema。");
+          }
+          await executor.setExecutionOptions({ schemaPath });
+          result(
+            schemaPath
+              ? `最终结果采用 Schema：${schemaPath}`
+              : "已关闭结构化输出。",
+          );
+        }
+        break;
+      case "usage":
+        if (args[0] === "quota" || /^\s*\/quota(?:\s|$)/.test(text))
+          await native("/usage");
+        else {
+          result(
+            `会话累计 Token：${s?.totalTokens || 0}\n最近结果：${JSON.stringify(s?.messages.filter((m) => m.role === "assistant").at(-1)?.usage || {})}\n不是账号额度或费用；子代理独立 token 未提供时不可用。`,
+          );
+        }
+        break;
+      case "permissions":
+        if (args[0] === "native") await native("/permissions");
+        else if (!args.length)
+          result(
+            `普通执行权限：${service.getConfig().dangerouslySkipPermissions ? "Danger" : "Safe"}；Plan 始终只读。逐次审批请使用原生终端，CLI 自动拒绝不是待审批。`,
+          );
+        else {
+          if (s?.planMode) throw new Error("Plan 始终只读，不能切换 Danger。");
+          await service.setDangerouslySkipPermissions(args[0] === "danger");
+        }
+        break;
+      case "skills":
+        this.management.clear();
+
+        this.publishCommands();
+        if (args[0] === "refresh" && !service.processing) {
+          requireCurrent();
+          await executor.setExecutionOptions({});
+        }
+        result(
+          (root ? this.management.skills(root) : [])
+            .map((skill) => `/${skill.name} · ${skill.origin}`)
+            .join("\n") +
+            "\n这里只列工作区/全局目录中发现的技能；内置和插件声明技能可到原生 /skills 查看。原生 CLI 负责展开。",
+        );
+        break;
+      case "skill":
+        if (!args[0] || !skills.some((skill) => skill.name === args[0]))
+          throw new Error("请用 /skills 选择已发现技能。");
+        if (s?.planMode)
+          throw new Error(
+            "Plan 不执行技能命令；请先 /plan off，或直接描述规划需求。",
+          );
+        await executor.sendMessage(
+          withContext(
+            "/" +
+              args[0] +
+              (args.length > 1 ? " " + args.slice(1).join(" ") : ""),
+          ),
+          requestId,
+          text,
+          undefined,
+          true,
+        );
+        break;
+      case "mcp": {
+        const operation = args[0] || "list";
+        if (operation === "add") {
+          await this.openManagementTerminal(["mcp", "add", "--help"], root);
+          result(
+            "已打开原生管理终端并显示 agy mcp add 帮助；请在终端完成添加。凭据不进入聊天记录。",
+          );
+          break;
+        }
+        result(
+          await run(["mcp", operation, ...args.slice(1)], operation === "list"),
+        );
+        if (operation !== "list") {
+          requireCurrent();
+          this.management.clear();
+          await executor.setExecutionOptions({});
+        }
+        break;
+      }
+      case "plugins": {
+        const operation = args[0] || "list";
+        if (["install", "import", "link"].includes(operation)) {
+          await this.openManagementTerminal(["plugin", ...args], root);
+          result(
+            "已在原生管理终端执行插件命令；结束后用 /skills refresh 刷新发现列表，当前会话下轮重新加载配置。",
+          );
+          requireCurrent();
+          await executor.setExecutionOptions({});
+          break;
+        }
+        result(
+          await run(
+            ["plugin", operation, ...args.slice(1)],
+            operation === "list",
+          ),
+        );
+        if (!["list", "validate"].includes(operation)) {
+          this.management.clear();
+          requireCurrent();
+          await executor.setExecutionOptions({});
+        }
+        break;
+      }
+      case "artifact": {
+        if (args[0] === "review") {
+          await native("/artifact");
+          break;
+        }
+        if (!s?.cliConversationId) {
+          result("当前对话尚无 CLI Artifact。");
+          break;
+        }
+        if (!/^[a-zA-Z0-9_-]{1,128}$/.test(s.cliConversationId))
+          throw new Error("无效 CLI 会话 ID。");
+        const directory = path.join(
+          os.homedir(),
+          ".gemini/antigravity-cli/brain",
+          s.cliConversationId,
+        );
+        if (!fs.existsSync(directory)) {
+          result("CLI 尚未生成 Artifact 文件。");
+          break;
+        }
+        const entries = fs
+          .readdirSync(directory, { withFileTypes: true })
+          .filter((e) => e.isFile() && !e.name.startsWith("."))
+          .slice(0, 1000);
+        if (args[0]) {
+          if (!entries.some((e) => e.name === args[0]))
+            throw new Error("当前 CLI 会话没有此 Artifact。");
+          const file = path.join(directory, args[0]);
+          if (fs.realpathSync(file) !== file)
+            throw new Error("不支持外部 Artifact 链接。");
+          await vscode.commands.executeCommand(
+            "vscode.open",
+            vscode.Uri.file(file),
+          );
+        } else
+          result(
+            entries
+              .map((e) => e.name + " · " + path.join(directory, e.name))
+              .join("\n") || "CLI 尚未生成 Artifact 文件。",
+          );
+        break;
+      }
+      case "capabilities": {
+        if (args[0] === "refresh") cliCapabilities.clear();
+        const capability = await cliCapabilities.discover(
+          service.getConfig().cliPath,
+          root || os.homedir(),
+        );
+        result(
+          JSON.stringify(
+            {
+              ...capability,
+              notes: [
+                "版本验证来自本机协议样本，不代表未来版本兼容或 OS 隔离。",
+                "逐工具审批协议未支持；schema 实验，sandbox 仅证明参数可启动。",
+                "缓存按启动文件身份与60秒TTL；包装器不变的转发目标更新依靠TTL或refresh。",
+              ],
+            },
+            null,
+            2,
+          ),
+        );
+        break;
+      }
+      case "diagnostics": {
+        if (args[0] === "clear") {
+          service.clearDiagnostics();
+          this.renderTelemetry.clear();
+          this.requestReceipts.clear();
+          result("宿主诊断时间线已清空；聊天记录不受影响。");
+          break;
+        }
+        const report = {
+          ...service.diagnosticsSnapshot(),
+          renderDelivery: this.renderTelemetry.stats(),
+          requestDelivery: this.requestReceipts.stats(),
+        };
+        if (args[0] !== "export") {
+          result(JSON.stringify(report, null, 2));
+          break;
+        }
+        const target = await vscode.window.showSaveDialog({
+          saveLabel: "导出诊断",
+          filters: { JSON: ["json"] },
+        });
+        if (!target) {
+          result("已取消导出，诊断时间线仍保留。");
+          break;
+        }
+        await vscode.workspace.fs.writeFile(
+          target,
+          Buffer.from(JSON.stringify(report, null, 2) + "\n"),
+        );
+        result("宿主诊断时间线已导出。该记录不包含模型内部或界面绘制时间。");
+        break;
+      }
+      case "version":
+        result(await run(["--version"], true));
+        break;
+      case "install":
+      case "mic-serve":
+        await this.openManagementTerminal(
+          [name, ...(args.length ? args : ["--help"])],
+          root,
+        );
+        result("已打开原生管理终端。");
+        break;
+      case "changelog":
+        result(await run(["changelog"], true));
+        break;
+      case "update":
+        await this.openManagementTerminal(["update"], root);
+        result(
+          "已在原生终端启动 CLI 更新；完成后重新加载扩展并核对版本兼容性。",
+        );
+        break;
+      default:
+        if (spec.route === "skill") {
+          if (s?.planMode)
+            throw new Error("Plan 不执行技能命令，请先 /plan off。");
+          await executor.sendMessage(
+            withContext(text),
+            requestId,
+            text,
+            undefined,
+            true,
+          );
+        } else await native();
     }
-    this.currentAssistantText = "";
-    this.currentTurnTools.clear();
-    this.currentTurnId = null;
+    return true;
+  }
+  private async openManagementTerminal(args: string[], root?: string) {
+    const { BinaryResolver } = await import("../core/binaryResolver");
+    const cli = await BinaryResolver.resolveCliPath(
+      this.agyService.getConfig().cliPath,
+    );
+    if (process.platform === "win32") {
+      vscode.window
+        .createTerminal({
+          name: "Antigravity 管理",
+          cwd: root,
+          shellPath: cli,
+          shellArgs: args,
+        })
+        .show();
+    } else {
+      const terminal = vscode.window.createTerminal({
+        name: "Antigravity 管理",
+        cwd: root,
+      });
+      const quote = (value: string) =>
+        "'" + value.replace(/'/g, "'\"'\"'") + "'";
+      terminal.sendText([cli, ...args].map(quote).join(" "), true);
+      terminal.show();
+    }
+  }
+  private commandPath(value: string, root: string): string {
+    if (value.startsWith("~/")) value = path.join(os.homedir(), value.slice(2));
+    return path.resolve(root, value);
+  }
+  private async gitChanges(root?: string, diff = false): Promise<string> {
+    if (!root) throw new Error("请先打开项目。");
+    return gitChanges(root, diff);
   }
 
   private async openResource(href: string): Promise<void> {
-    if (/^https?:\/\//i.test(href)) {
-      await vscode.env.openExternal(vscode.Uri.parse(href));
+    await this.editorActions.openResource(href);
+  }
+
+  private resolveFileReference(href: string): {
+    filePath?: string;
+    line?: number;
+    column?: number;
+  } {
+    return this.editorActions.resolveFileReference(href);
+  }
+
+  private async handleContextRequest(
+    type: "problems" | "git" | "file" | "selection",
+  ): Promise<void> {
+    await this.contextAdapter.request(type);
+  }
+
+  public async sendCodeContext(
+    code: string,
+    fileName?: string,
+    lineCount?: number,
+    title?: string,
+    details?: Partial<ContextAttachment>,
+  ): Promise<void> {
+    await this.contextAdapter.sendCodeContext(
+      code,
+      fileName,
+      lineCount,
+      title,
+      details,
+    );
+  }
+
+  private async saveContext(
+    sessionId: string,
+    attachment: NonNullable<SessionMeta["attachment"]>,
+  ): Promise<void> {
+    if (this.disposed) throw new Error("上下文操作已结束。");
+    if (this.agyService.currentSessionMeta?.id !== sessionId)
+      throw new Error("会话已切换，请重新添加文件上下文。");
+    const runner = this.agyService.executionTarget();
+    const session = runner.currentSessionMeta;
+    if (!session || session.id !== sessionId)
+      throw new Error("会话已切换，请重新添加文件上下文。");
+    await runner.saveDraft(session.draft || "", attachment);
+    if (this.disposed || this.agyService.currentSessionMeta?.id !== sessionId)
       return;
-    }
-
-    const { filePath, line } = this.resolveFileReference(href);
-    if (!filePath || !fs.existsSync(filePath)) {
-      throw new Error(`File not found: ${filePath || href}`);
-    }
-
-    const document = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
-    const options: vscode.TextDocumentShowOptions = { preview: true };
-    if (line !== undefined) {
-      const position = new vscode.Position(Math.max(0, Math.min(line - 1, document.lineCount - 1)), 0);
-      options.selection = new vscode.Range(position, position);
-    }
-    await vscode.window.showTextDocument(document, options);
-  }
-
-  private resolveFileReference(href: string): { filePath?: string; line?: number } {
-    let value = decodeURIComponent(href.trim());
-    let line: number | undefined;
-    const lineMatch = value.match(/(?:#L|:)(\d+)(?::\d+)?$/i);
-    if (lineMatch) {
-      line = Number(lineMatch[1]);
-      value = value.slice(0, lineMatch.index);
-    }
-
-    if (value.startsWith("file://")) {
-      return { filePath: vscode.Uri.parse(value).fsPath, line };
-    }
-    if (value.startsWith("~/")) value = path.join(os.homedir(), value.slice(2));
-    if (path.isAbsolute(value)) return { filePath: path.normalize(value), line };
-
-    const folders = vscode.workspace.workspaceFolders || [];
-    const activeDirectory = vscode.window.activeTextEditor?.document.uri.scheme === "file"
-      ? path.dirname(vscode.window.activeTextEditor.document.uri.fsPath)
-      : undefined;
-    const roots = [activeDirectory, ...folders.map((folder) => folder.uri.fsPath)]
-      .filter((root, index, all): root is string => Boolean(root) && all.indexOf(root) === index);
-    for (const root of roots) {
-      const candidate = path.resolve(root, value);
-      if (fs.existsSync(candidate)) return { filePath: candidate, line };
-    }
-    const root = roots[0];
-    return { filePath: root ? path.resolve(root, value) : undefined, line };
-  }
-
-  private async handleContextRequest(type: "problems" | "git" | "file"): Promise<void> {
-    if (type === "problems") {
-      const allDiagnostics = vscode.languages.getDiagnostics();
-      let report = "";
-      let count = 0;
-      for (const [uri, diags] of allDiagnostics) {
-        const errors = diags.filter(d => d.severity === vscode.DiagnosticSeverity.Error || d.severity === vscode.DiagnosticSeverity.Warning);
-        if (errors.length > 0) {
-          report += `File: ${path.basename(uri.fsPath)} (${uri.fsPath})\n`;
-          for (const d of errors) {
-            report += `  Line ${d.range.start.line + 1}: [${d.severity === vscode.DiagnosticSeverity.Error ? "Error" : "Warning"}] ${d.message}\n`;
-            count++;
-          }
-        }
-      }
-      if (count === 0) {
-        vscode.window.showInformationMessage("Antigravity: No problems/errors found in workspace!");
-        return;
-      }
-      this.sendCodeContext(report, "Workspace Problems", count, "Fix Problems in Workspace");
-    } else if (type === "file") {
-      const uris = await vscode.window.showOpenDialog({
-        canSelectFiles: true,
-        canSelectFolders: false,
-        canSelectMany: false,
-        title: "Select file to attach as context"
-      });
-      if (uris && uris.length > 0) {
-        const doc = await vscode.workspace.openTextDocument(uris[0]);
-        this.sendCodeContext(doc.getText(), path.basename(uris[0].fsPath), doc.lineCount);
-      }
-    }
-  }
-
-  public sendCodeContext(code: string, fileName?: string, lineCount?: number, title?: string): void {
-    if (this.view) {
-      this.view.show(true);
-      this.postMessage({
-        type: "setContext",
-        code,
-        file: fileName,
-        lineCount,
-        title,
-      });
-    }
-  }
-
-  private refreshSessionList(): void {
-    const sessions = this.sessionStore.getAllSessions().map((s) => ({
-      id: s.id,
-      title: s.title,
-      updatedAt: s.updatedAt,
-    }));
-    const currentId = this.sessionStore.getCurrentSessionId() || "";
+    this.view?.show(true);
     this.postMessage({
-      type: "sessionList",
-      sessions,
-      currentId,
-    });
-  }
-
-  private initCurrentSessionInWebview(): void {
-    const session = this.agyService.currentSessionMeta;
-    if (session) this.initSessionInWebview(session);
-  }
-
-  private initSessionInWebview(session: SessionMeta): void {
-    const config = this.agyService.getConfig();
-    this.postMessage({
-      type: "initSession",
-      session,
-      config: {
-        dangerouslySkipPermissions: config.dangerouslySkipPermissions,
-        autoScroll: config.autoScroll,
-      },
-    });
-  }
-
-  private async sendSlashCommands(): Promise<void> {
-    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-    const items = await SlashCommandResolver.getAvailableItems(workspaceRoot);
-    this.postMessage({
-      type: "slashCommands",
-      commands: items,
+      type: "setContext",
+      sessionId,
+      attachment,
+      code: attachment.code,
+      title: attachment.title,
     });
   }
 
   private postMessage(message: WebviewMessage): void {
-    if (this.view) {
-      this.view.webview.postMessage(message);
+    if (this.view && !this.disposed) {
+      // Hidden output lives in the execution repository; showing the view sends a fresh snapshot.
+      if (this.view.visible === false && message.sequence !== undefined) return;
+      const renderedMessage =
+        this.view.visible === false
+          ? message
+          : this.renderTelemetry.decorate(message);
+      this.view.webview.postMessage(renderedMessage);
     }
   }
 
   private getHtmlForWebview(webview: vscode.Webview): string {
     const nonce = `${Date.now()}${Math.random().toString(36).slice(2)}`;
     const styleUri = webview.asWebviewUri(
-      vscode.Uri.joinPath(this.extensionUri, "media", "chat.css")
+      vscode.Uri.joinPath(this.extensionUri, "media", "chat.css"),
     );
     const scriptUri = webview.asWebviewUri(
-      vscode.Uri.joinPath(this.extensionUri, "media", "chat.js")
+      vscode.Uri.joinPath(this.extensionUri, "media", "chat.js"),
     );
-    const markedUri = webview.asWebviewUri(
-      vscode.Uri.joinPath(this.extensionUri, "media", "vendor", "marked.min.js")
-    );
-
-    return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource} data:; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';">
-  <link href="${styleUri}" rel="stylesheet" />
-  <script nonce="${nonce}" src="${markedUri}"></script>
-  <title>Antigravity Extender</title>
-</head>
-<body>
-  <!-- Header -->
-  <div class="chat-header">
-    <div class="header-title">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-        <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
-      </svg>
-      <span>ANTIGRAVITY</span>
-    </div>
-    <div class="header-controls">
-      <!-- Plan Mode Indicator Badge -->
-      <div id="plan-mode-pill" class="plan-mode-pill hidden" title="Plan Mode Active">
-        <span>💡 PLAN</span>
-        <span id="close-plan-mode-btn" class="close-plan-btn" title="Exit Plan Mode">✕</span>
-      </div>
-
-      <!-- Permission Toggle Mode -->
-      <button id="perm-toggle-btn" class="perm-badge danger-mode" title="Toggle Danger/Safe Permission Mode">
-        <span class="perm-icon">⚡</span>
-        <span class="perm-text">Danger</span>
-      </button>
-
-      <select id="model-select" class="select-compact" title="Switch Model">
-        <option value="gemini-3.8-flash-high">Gemini 3.8 Flash</option>
-        <option value="gemini-3.7-flash-high">Gemini 3.7 Flash</option>
-        <option value="gemini-3.1-pro-high">Gemini 3.1 Pro</option>
-      </select>
-      <select id="effort-select" class="select-compact" title="Reasoning Effort">
-        <option value="high">High</option>
-        <option value="medium">Med</option>
-        <option value="low">Low</option>
-      </select>
-      <button id="new-chat-btn" class="btn-icon" title="New Session">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <line x1="12" y1="5" x2="12" y2="19"></line>
-          <line x1="5" y1="12" x2="19" y2="12"></line>
-        </svg>
-      </button>
-    </div>
-  </div>
-
-  <!-- Session Switcher Bar & Quick Context Chips -->
-  <div class="sessions-bar">
-    <span style="opacity:0.7;">Chat:</span>
-    <select id="session-select" class="sessions-dropdown"></select>
-  </div>
-
-  <!-- Quick Action Chips -->
-  <div class="context-chips-bar">
-    <button class="context-chip" id="chip-attach-file" title="Attach file to context">+ File</button>
-    <button class="context-chip" id="chip-problems" title="Inspect & fix active workspace problems">+ Problems</button>
-  </div>
-
-  <!-- Messages List -->
-  <div class="messages-container" id="messages">
-    <!-- Messages & Tool Cards will be injected dynamically -->
-  </div>
-
-  <!-- Context Snippet preview -->
-  <div id="context-preview" class="context-preview" style="display:none;">
-    <span id="context-text">Attached: code selection</span>
-    <span id="remove-context-btn" class="context-remove-btn" title="Remove context">✕</span>
-  </div>
-
-  <!-- Footer / Input Box -->
-  <div class="input-area">
-    <!-- Slash / Skills Menu -->
-    <div id="slash-menu" class="slash-menu" style="display:none;"></div>
-    <div class="input-box-wrapper">
-      <textarea id="chat-input" class="chat-input" rows="1" placeholder="Ask Antigravity anything... (Enter to send, Shift+Enter for newline)"></textarea>
-    </div>
-    <div class="input-actions">
-      <div class="model-status-tag" id="status-info">Ready</div>
-      <div class="send-btn-group">
-        <button id="stop-btn" class="btn-stop" style="display:none;">Stop</button>
-        <button id="send-btn" class="btn-primary">
-          <span>Send</span>
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <line x1="22" y1="2" x2="11" y2="13"></line>
-            <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
-          </svg>
-        </button>
-      </div>
-    </div>
-  </div>
-
-  <script nonce="${nonce}" src="${scriptUri}"></script>
-</body>
-</html>`;
+    return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource} data:; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';"><link href="${styleUri}" rel="stylesheet"><title>Antigravity</title></head><body><div id="root"></div><script nonce="${nonce}" src="${scriptUri}"></script></body></html>`;
   }
 }

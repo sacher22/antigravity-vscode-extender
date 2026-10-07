@@ -1,0 +1,21 @@
+src/core/toolPresentation.ts 104ms
+src/core/imageAttachments.ts 4ms (unchanged)
+src/core/types.ts 57ms
+src/core/codeBlocks.ts 10ms
+src/core/contextAttachments.ts 20ms
+src/conversation/imageStore.ts 14ms
+src/conversation/recoveryGuard.ts 13ms
+src/conversation/controller.ts 218ms
+src/conversation/repository.ts 151ms
+src/ui/chatViewProvider.ts 94ms
+src/ui/webviewBridge.ts 17ms
+src/ui/editorActions.ts 16ms
+src/webview/messageTimeline.ts 7ms
+src/webview/Message.tsx 28ms
+src/webview/ToolDetails.tsx 16ms
+src/webview/CodeActions.tsx 11ms
+src/webview/Composer.tsx 22ms
+src/webview/ComposerInput.tsx 10ms
+src/webview/imageUpload.ts 4ms
+src/webview/index.tsx 31ms
+src/webview/state.ts 17ms

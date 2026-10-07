@@ -1,8 +1,8 @@
 {
   "name": "antigravity-vscode-extender",
   "displayName": "Antigravity Extender",
-  "description": "Supercharged Antigravity AI Coding Extender for VS Code with Native Stream-JSON & Agent Capabilities",
-  "version": "1.3.3",
+  "description": "Lightweight Antigravity CLI chat sidebar with recoverable conversations and workspace-aware execution",
+  "version": "2.5.2",
   "publisher": "antigravity",
   "repository": {
     "type": "git",
@@ -19,15 +19,24 @@
   ],
   "main": "./out/extension.js",
   "files": [
-    "out/**/*",
-    "media/**/*",
-    "resources/**/*",
+    "out/extension.js",
+    "out/adapters/**/*.js",
+    "out/commands/**/*.js",
+    "out/conversation/**/*.js",
+    "out/core/**/*.js",
+    "out/services/**/*.js",
+    "out/ui/**/*.js",
+    "media/chat.js",
+    "media/chat.css",
+    "resources/**/*.png",
+    "resources/**/*.svg",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "docs/**/*.md"
   ],
   "icon": "resources/antigravity-icon.png",
   "activationEvents": [
-    "onStartupFinished"
+    "onView:antigravity.chatView"
   ],
   "contributes": {
     "viewsContainers": {
@@ -58,52 +67,8 @@
         "command": "antigravity.newSession",
         "title": "Antigravity: New Conversation",
         "category": "Antigravity"
-      },
-      {
-        "command": "antigravity.explainCode",
-        "title": "Antigravity: Explain Code",
-        "category": "Antigravity"
-      },
-      {
-        "command": "antigravity.refactorCode",
-        "title": "Antigravity: Refactor Code",
-        "category": "Antigravity"
-      },
-      {
-        "command": "antigravity.generateTests",
-        "title": "Antigravity: Generate Unit Tests",
-        "category": "Antigravity"
-      },
-      {
-        "command": "antigravity.fixCode",
-        "title": "Antigravity: Fix Problems & Bugs",
-        "category": "Antigravity"
       }
     ],
-    "menus": {
-      "editor/context": [
-        {
-          "command": "antigravity.explainCode",
-          "group": "Antigravity@1",
-          "when": "editorHasSelection"
-        },
-        {
-          "command": "antigravity.refactorCode",
-          "group": "Antigravity@2",
-          "when": "editorHasSelection"
-        },
-        {
-          "command": "antigravity.generateTests",
-          "group": "Antigravity@3",
-          "when": "editorHasSelection"
-        },
-        {
-          "command": "antigravity.fixCode",
-          "group": "Antigravity@4",
-          "when": "editorHasSelection"
-        }
-      ]
-    },
     "configuration": {
       "title": "Antigravity Extender",
       "properties": {
@@ -121,7 +86,12 @@
             "gemini-3.8-flash-low",
             "gemini-3.7-flash-high",
             "gemini-3.7-flash-medium",
-            "gemini-3.1-pro-high"
+            "gemini-3.7-flash-low",
+            "gemini-3.6-flash-high",
+            "gemini-3.6-flash-medium",
+            "gemini-3.6-flash-low",
+            "gemini-3.1-pro-high",
+            "gemini-3.1-pro-low"
           ],
           "description": "Default model used for Antigravity sessions."
         },
@@ -131,13 +101,14 @@
           "enum": [
             "high",
             "medium",
-            "low"
+            "low",
+            "max"
           ],
           "description": "Reasoning effort / thinking budget level."
         },
         "antigravity.dangerouslySkipPermissions": {
           "type": "boolean",
-          "default": true,
+          "default": false,
           "description": "Automatically allow tool execution (file editing, terminal commands) without manual approval prompts (Danger Mode)."
         },
         "antigravity.autoScroll": {
@@ -148,22 +119,39 @@
         "antigravity.includeProjectRules": {
           "type": "boolean",
           "default": true,
-          "description": "Automatically load .antigravityrules or AGENTS.md from workspace root as instructions."
+          "description": "Deprecated: project instructions are loaded by the native CLI. This setting does not disable CLI rules.",
+          "deprecationMessage": "CLI v1.2.14 has no verified flag to disable project instructions; this setting cannot control native rule loading."
         }
       }
     }
   },
   "scripts": {
-    "vscode:prepublish": "npm run compile",
-    "compile": "tsc -p ./",
+    "vscode:prepublish": "npm run compile && npm run check:package",
+    "compile": "node scripts/clean-build.js && tsc -p ./ && node scripts/build-webview.js",
     "test": "npm run compile && node --test test/*.test.js",
-    "watch": "tsc -watch -p ./",
-    "package": "vsce package --no-dependencies"
+    "watch": "node scripts/watch-build.cjs",
+    "package": "vsce package --no-dependencies",
+    "test:performance": "npm run compile && node scripts/benchmark-webview.cjs",
+    "format": "prettier --write src scripts test media/chat.css",
+    "archive:symbols": "node scripts/archive-debug-symbols.cjs",
+    "check:package": "node scripts/check-package-content.cjs"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
     "@types/vscode": "^1.85.0",
     "@vscode/vsce": "^3.2.1",
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1",
+    "dompurify": "^3.4.16",
+    "esbuild": "^0.28.2",
+    "jsdom": "^26.1.0",
+    "marked": "^18.0.14",
+    "playwright": "^1.63.0",
+    "prettier": "^3.9.9",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
     "typescript": "^5.3.3"
   }
 }

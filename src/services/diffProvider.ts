@@ -11,6 +11,14 @@ export class DiffContentProvider implements vscode.TextDocumentContentProvider {
     this.onDidChangeEmitter.fire(uri);
   }
 
+  public removeContent(uri: string): void {
+    this.contentMap.delete(uri);
+  }
+  public dispose(): void {
+    this.contentMap.clear();
+    this.onDidChangeEmitter.dispose();
+  }
+
   public provideTextDocumentContent(uri: vscode.Uri): string {
     return this.contentMap.get(uri.toString()) || "";
   }

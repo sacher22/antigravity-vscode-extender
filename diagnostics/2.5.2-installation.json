@@ -1,0 +1,13 @@
+{
+  "version": "2.5.2",
+  "registered": true,
+  "verifiedFiles": 89,
+  "fileMismatches": [],
+  "sameRuntimeAsAcceptedWindow": true,
+  "vsixSha256": "22f5f064f4c6b57b8cee960fea8aef1abc024b1e3d131b7782df813f1b8fe1fa",
+  "preservedHashes": {
+    "/mnt/c/Users/shuheng/AppData/Roaming/Code/User/settings.json": true,
+    "/home/ubuntu/.local/bin/agy-gemini": true,
+    "/home/ubuntu/.local/lib/antigravity-cli/stream_compat.py": true
+  }
+}

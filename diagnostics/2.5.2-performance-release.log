@@ -1,0 +1,19 @@
+{
+  backgroundConversations: 3,
+  agentCards: 20,
+  environment: 'headless Chromium; actual React bundle + bridge + controller + POSIX fake CLI',
+  textCharacters: 100021,
+  toolCards: 1000,
+  toolOutputBytes: 80000000,
+  samples: 21,
+  latencies: [
+    36, 38, 42, 42, 43, 43,  44,
+    44, 44, 44, 44, 45, 45,  45,
+    45, 45, 45, 46, 46, 66, 111
+  ],
+  p95Ms: 66,
+  stopMs: 107,
+  scrollPreserved: true,
+  inputResponsive: true,
+  errors: []
+}

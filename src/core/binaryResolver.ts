@@ -1,4 +1,3 @@
-import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
@@ -14,7 +13,9 @@ export class BinaryResolver {
       if (fs.existsSync(expanded)) {
         return expanded;
       }
-      throw new Error(`Configured Antigravity CLI path does not exist: ${configuredPath}`);
+      throw new Error(
+        `Configured Antigravity CLI path does not exist: ${configuredPath}`,
+      );
     }
 
     // Common standard paths
@@ -48,7 +49,7 @@ export class BinaryResolver {
     }
 
     throw new Error(
-      `Could not find Antigravity CLI ("agy") binary. Please install Antigravity CLI or specify its path in settings ("antigravity.cliPath").`
+      `Could not find Antigravity CLI ("agy") binary. Please install Antigravity CLI or specify its path in settings ("antigravity.cliPath").`,
     );
   }
 

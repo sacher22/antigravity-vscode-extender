@@ -1,0 +1,7 @@
+{
+  "passed": false,
+  "version": "2.5.2",
+  "environment": "Windows VS Code + WSL actual installed extension; deterministic acceptance CLI",
+  "steps": [],
+  "error": "Error: Missing owned sidebar\n    at frame (C:\\Users\\Public\\agy252-acceptance\\accept.cjs:8:184)\n    at async C:\\Users\\Public\\agy252-acceptance\\accept.cjs:9:56"
+}

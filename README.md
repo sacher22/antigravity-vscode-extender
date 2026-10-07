@@ -1,50 +1,55 @@
-# Antigravity Extender for VS Code
+# Antigravity Extender
 
-超级增强版 Antigravity VS Code 扩展。针对原版使用 PTY 终端模拟抓屏导致的吞字、乱码、卡顿和状态丢失问题，采用 Antigravity CLI 原生双向 Stream-JSON 架构全新重写。
+A lightweight VS Code sidebar for the Antigravity CLI. The CLI runs tasks; the extension manages conversation history, streamed output and editor context.
 
-## 1.3 性能与体验更新
+## 当前版本：2.5.2
 
-- CLI 在侧栏打开时后台预热，发送链路使用严格的初始化和 stdin 写入确认，不再把失效进程显示为永久 Thinking。
-- 流式 Markdown 按 50ms 合并更新，已完成内容保持稳定，长回答不再逐 token 重绘整段 DOM。
-- 工具调用按执行顺序显示为紧凑卡片，成功后默认折叠，失败自动展开，长输出按需创建预览。
-- Stop 会完整结束旧进程后恢复输入；模型、思考深度、权限和 Plan 模式切换会重启并应用实际 CLI 参数。
-- `Antigravity Extender` Output Channel 提供脱敏后的启动、首事件和完成耗时，便于区分扩展延迟与模型等待。
-- Agent 完成计划并等待确认时会立即恢复输入，并提供“执行 / 修改要求”操作，无需 Stop。
-- 回答中的文件链接和行号可直接点击，在 VS Code 编辑器中打开并定位。
-- 新会话绑定当前 VS Code 工作区项目；用户产物固定写入工作区，Antigravity 的 `brain` 目录只保留内部计划元数据。
-- 等待计划批准时输入新问题会取消待执行计划；澄清问题与执行确认使用不同的操作状态。
-- Plan Mode 会在关键需求不明确时先请求补充信息，再生成计划并等待明确批准。
-- 空白新会话只保留一个本地草稿，首条消息发送时才创建 CLI conversation；快速切换会取消旧预热，不再留下空会话或绑定错误进程。
+2.5.2 合并正文、工具和错误的执行顺序，显示紧凑工具摘要，提供流中断恢复提示，并保留截图附件支持。验证结果与限制见 [2.5.2 发布记录](docs/RELEASE-2.5.2.md)。此前全面优化及两小时稳定性验收仍未全部完成。
 
-## ✨ 核心特性
+新增 `/capabilities [refresh]`，查询实际 CLI 启动路径、版本及已验证能力。当前协议证据覆盖本机 v1.2.14 与 v1.2.16；其他版本或查询失败时，侧栏阻止协议执行并保留草稿，可通过 `/cli` 打开独立原生终端。该降级入口不会自动复用侧栏会话或模型/模式参数，需在 CLI 中核对；已验证版本仍使用完整参数交接。MCP/插件修改操作同样要求版本验证，只读查询保留。
 
-1. **原生 Stream-JSON 协议驱动**
-   - 彻底告别 PTY 终端屏抓，毫秒级打字机流式输出。
-   - 原生支持 `init`、`step_update` 与 `result` 事件，精准区分思考过程与工具调用。
+探测只执行 `--version`，进程有超时和输出预算，缓存按路径、启动文件身份、工作目录及 60 秒有效期保存；已运行的聊天进程复用，不每轮启动发现进程。包装器内容不变但转发目标更新时，依靠有效期或 `refresh` 重新探测。版本不是 OS 沙箱或所有原生能力的保证：逐工具审批仍不支持，Schema 实验，sandbox 仅验证参数可启动。
 
-2. **⚡ Danger Permission (极客/安全权限模式一键切换)**
-   - **Danger Mode (⚡ 极客模式)**：自动注入 `--dangerously-skip-permissions`，让 Agent 全自动执行编译、运行测试、写文件与修复，提供丝滑无人值守编程体验。
-   - **Safe Mode (🛡️ 安全模式)**：拦截任何自动命令与系统写操作，需用户授权。
-   - 支持在侧边栏顶部直接点击药丸徽章切换，并在 VS Code Settings 中持久化。
+## Features
 
-3. **🔍 差异对比 (Diff View) 与代码一键应用 (Apply to File)**
-   - 代码块右上角提供 **Diff** 按钮：利用 VS Code 原生 `vscode.diff` 打开差异比对面板，清楚审查建议改动。
-   - **Apply** 按钮：一键将代码覆盖替换选区或插入到当前打开的编辑器中。
+- Real new conversations, per-session drafts, history paging and recovery.
+- One **普通 / Plan** selector, model/effort selection and Safe/Danger permissions.
+- Project directories follow the currently opened VS Code workspace, including multi-root workspaces.
+- File and problem context, tool cards with paged output, file links, diff preview and document-version-checked apply.
+- Stop during startup or execution; POSIX tool process-group cleanup.
+- Native CLI handoff for verified permission denials and unsupported interactive CLI actions.
+- React + TypeScript interface, 30 ms text batching, incremental streaming text and sanitized completed Markdown.
 
-4. **📎 快捷上下文注入 (Context Chips)**
-   - **+ Problems**：一键捕获当前工作区所有 Linter 与编译报错，自动附带给 Agent 排查修复。
-   - **+ File**：一键浏览并附加指定工作区文件作为问答上下文。
+## Installation
 
-5. **模型与思考深度随时切换**
-   - 侧边栏顶部下拉菜单快捷切换：Gemini 3.8 Flash / Gemini 3.7 Flash / Gemini 3.1 Pro。
-   - 思考深度实时调节：High / Med / Low。
+Install the **2.5.2** VSIX archive in VS Code using **Extensions → Install from VSIX…**, or run:
 
-6. **右键代码快捷操作**
-   - 选中编辑器代码右键可呼出：
-     - 💡 Antigravity: Explain Code
-     - ⚡ Antigravity: Refactor Code
-     - 🧪 Antigravity: Generate Unit Tests
-     - 🔧 Antigravity: Fix Problems & Bugs
+```sh
+code --install-extension ./antigravity-vscode-extender-2.5.2.vsix --force
+```
 
-7. **会话管理与跨轮接续**
-   - 自动持久化本地会话，支持随时恢复历史多轮上下文（`--conversation <id>`）。
+After active tasks have finished, reload your VS Code window to load an installed update. Open a folder before sending messages. The extension uses your existing `agy` launcher and `antigravity.*` settings. Permission defaults to Safe for new installations; existing explicit Danger configuration is respected.
+
+History migration preserves original data. Rollback instructions and architecture are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); measured results and limitations are in [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md).
+
+## Development
+
+```sh
+npm ci
+npm test
+npm run check:package
+npm run test:performance
+```
+
+Tests execute the actual React Webview bundle through Provider, Bridge, Controller and a deterministic CLI. Protocol fixtures capture CLI v1.2.14 and v1.2.16 behavior, including Plan and denied actions. Browser stress tests and real VS Code window results are reported separately.
+
+`check:package` checks actual vsce file discovery, including every compiled Host module, and rejects sourcemaps, duplicate browser modules and unexpected files. Before release, preserve debug symbols with `npm run archive:symbols -- /absolute/path/to/new-private-directory`; the output directory must be new. Release packaging uses `npm run package` after assigning an independent version and completing the [release gates](docs/OPTIMIZATION-PLAN.md). The Linux CI workflow covers build/regression/package content; real CLI, WSL windows and long performance acceptance run separately.
+
+### 2.1 更新
+
+新建/切换对话保留后台任务；Plan 使用只读工具并等待“批准并执行方案”；Agent 按钮可查看原生子代理卡片与独立对话日志。独立 token 和完整生命周期缺失时明确显示不可用，子代理工具的直接审批仍需原生 CLI。完整说明与性能证据见 [2.1 发布记录](docs/RELEASE-2.1.md)。
+
+
+## 2.2 斜杠命令
+
+输入 `/help` 查看完整入口；常用 `/new`、`/stop`、`/plan <需求>`、`/approve`、`/model`、`/skills`、`/open "文件:行号"`。新建不停止后台任务。未知命令明确报错；未经验证的原生交互功能转到 CLI 终端。Schema 属于实验功能。功能范围和限制见 [2.2 发布记录](docs/RELEASE-2.2.md)。

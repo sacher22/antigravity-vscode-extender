@@ -1,0 +1,5 @@
+# Source restoration (2026-10-05)
+
+Recovered from /home/ubuntu/.local/share/antigravity-extender-delegation/20261004-233505-2.5-completion-final-freeze. Installed 2.5.1 backend differed in seven JS files. The image delta was reconstructed in TypeScript: controller, contextAttachments, chatViewProvider and webviewBridge compiled byte-for-byte equal to installed JS; repository and imageAttachments differed in method placement/comments. imageStore was reconstructed from installed JS, including its original storage limits and header checks. Other backend JS matched the installed baseline before this task's fixes. Webview source is recovered/rebuilt, not original lost 2.5.1 TSX. Screenshot behavior has module, full Provider chain and installed Chromium verification.
+
+Missing native 1.2.14 fixture captures were recovered from before-2.1 and markdown-layout-experiment backups. No private API configuration was recovered or changed. The original handoff file was missing; PROJECT-HANDOFF.md is a new current handoff, not the original text.

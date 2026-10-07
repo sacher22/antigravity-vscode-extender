@@ -1,0 +1,19 @@
+name: Build and regression
+on:
+  push:
+  pull_request:
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run check:package
+      # Real CLI/API, Windows/WSL windows, and long performance acceptance
+      # require isolated local runs; this job makes no claim about those gates.

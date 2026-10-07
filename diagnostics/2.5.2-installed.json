@@ -1,0 +1,29 @@
+{
+  "passed": true,
+  "version": "2.5.2",
+  "environment": "Windows VS Code + WSL actual installed extension; deterministic acceptance CLI",
+  "steps": [
+    "actual installed 2.5.2 loaded",
+    "Plan chronology and zero Mermaid edit controls",
+    "compact summaries expand real parameters",
+    "owned window reload preserves chronology and Plan",
+    "real Chromium ClipboardEvent image paste, preview and removal; no OS clipboard modified",
+    "intermediate errors visible, repeated recovery stopped, abnormal tool not green success",
+    "resume prepares draft without sending"
+  ],
+  "scripts": [
+    "https://vscode-remote+wsl-002bubuntu-002d24-002e04.vscode-resource.vscode-cdn.net/home/ubuntu/.vscode-server/extensions/antigravity.antigravity-vscode-extender-2.5.2/media/chat.js"
+  ],
+  "sessionIds": [
+    "sess_fb2c5227-7bb7-4531-a8c7-50b653ff394f",
+    "sess_699bba57-3ab3-41f1-bc44-8ed040c6c06f"
+  ],
+  "finalVisual": {
+    "passed": true,
+    "toolBorders": [
+      "0px",
+      "0px"
+    ],
+    "closedOnlyOwnedAcceptanceWindow": true
+  }
+}

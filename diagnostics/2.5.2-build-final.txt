@@ -1,0 +1,4 @@
+
+> antigravity-vscode-extender@2.5.2 compile
+> node scripts/clean-build.js && tsc -p ./ && node scripts/build-webview.js
+
